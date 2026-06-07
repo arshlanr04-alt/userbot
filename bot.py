@@ -32,6 +32,12 @@ CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 # format: { user_id: { "client": Client, "phone": str, "phone_code_hash": str, "simulation": bool } }
 temp_userbot_logins = {}
 
+# Temporary store for /forward confirmations
+temp_forward_confirms = {}
+
+# Active forwarding tasks
+active_forwarding_tasks = {}
+
 import threading
 
 # Create a global background event loop to run all Pyrogram tasks
@@ -129,8 +135,29 @@ class DBManager:
                     "user_id BIGINT, "
                     "phone TEXT, "
                     "session_string TEXT, "
+                    "first_name TEXT, "
+                    "username TEXT, "
                     "active BOOLEAN DEFAULT TRUE, "
                     "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")", commit=True
+                )
+                self.execute_query(
+                    "CREATE TABLE IF NOT EXISTS target_chats ("
+                    "id SERIAL PRIMARY KEY, "
+                    "user_id BIGINT, "
+                    "chat_id BIGINT, "
+                    "chat_title TEXT, "
+                    "chat_username TEXT, "
+                    "active BOOLEAN DEFAULT TRUE, "
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")", commit=True
+                )
+                self.execute_query(
+                    "CREATE TABLE IF NOT EXISTS user_settings ("
+                    "user_id BIGINT PRIMARY KEY, "
+                    "custom_caption TEXT, "
+                    "filters TEXT, "
+                    "remove_words TEXT"
                     ")", commit=True
                 )
             except Exception as e:
@@ -163,6 +190,19 @@ class DBManager:
                 "user_id INTEGER, "
                 "phone TEXT, "
                 "session_string TEXT, "
+                "first_name TEXT, "
+                "username TEXT, "
+                "active INTEGER DEFAULT 1, "
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS target_chats ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "user_id INTEGER, "
+                "chat_id INTEGER, "
+                "chat_title TEXT, "
+                "chat_username TEXT, "
                 "active INTEGER DEFAULT 1, "
                 "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ")"
@@ -185,10 +225,377 @@ class DBManager:
         except Exception:
             pass
             
+        # Run safe migrations to add new columns to linked_userbots if they are missing
+        try:
+            self.execute_query("ALTER TABLE linked_userbots ADD COLUMN first_name TEXT", commit=True)
+        except Exception:
+            pass
+        try:
+            self.execute_query("ALTER TABLE linked_userbots ADD COLUMN username TEXT", commit=True)
+        except Exception:
+            pass
+            
+        # Run safe migrations to create target_chats and user_settings if sqlite database was already created
+        if not self.db_url:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "CREATE TABLE IF NOT EXISTS target_chats ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "user_id INTEGER, "
+                    "chat_id INTEGER, "
+                    "chat_title TEXT, "
+                    "chat_username TEXT, "
+                    "active INTEGER DEFAULT 1, "
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                cursor.execute(
+                    "CREATE TABLE IF NOT EXISTS user_settings ("
+                    "user_id INTEGER PRIMARY KEY, "
+                    "custom_caption TEXT, "
+                    "filters TEXT, "
+                    "remove_words TEXT"
+                    ")"
+                )
+                conn.commit()
+                cursor.close()
+                conn.close()
+            except Exception:
+                pass
+            
         logger.info("Database initialized successfully.")
 
 # Initialize DB Manager
 db = DBManager()
+
+def get_user_settings(user_id):
+    """Retrieves settings for a specific user, creating default settings if missing."""
+    row = db.execute_query(
+        "SELECT custom_caption, filters, remove_words FROM user_settings WHERE user_id = %s",
+        (user_id,), fetch="one"
+    )
+    if not row:
+        default_filters = {
+            "forward_tag": False,
+            "texts": True,
+            "documents": True,
+            "videos": True,
+            "photos": True,
+            "audios": True,
+            "voices": True,
+            "animations": True,
+            "stickers": True,
+            "skip_duplicate": True,
+            "poll": True,
+            "secure_message": False
+        }
+        filters_json = json.dumps(default_filters)
+        empty_words_json = json.dumps([])
+        try:
+            db.execute_query(
+                "INSERT INTO user_settings (user_id, custom_caption, filters, remove_words) VALUES (%s, %s, %s, %s)",
+                (user_id, None, filters_json, empty_words_json), commit=True
+            )
+        except Exception as e:
+            logger.error(f"Error inserting default user settings: {e}")
+        return {
+            "custom_caption": None,
+            "filters": default_filters,
+            "remove_words": []
+        }
+    
+    custom_caption, filters_str, remove_words_str = row
+    try:
+        filters = json.loads(filters_str) if filters_str else {}
+    except:
+        filters = {}
+    try:
+        remove_words = json.loads(remove_words_str) if remove_words_str else []
+    except:
+        remove_words = []
+        
+    return {
+        "custom_caption": custom_caption,
+        "filters": filters,
+        "remove_words": remove_words
+    }
+
+def save_user_settings(user_id, settings):
+    """Saves user settings back to the database."""
+    filters_str = json.dumps(settings.get("filters", {}))
+    remove_words_str = json.dumps(settings.get("remove_words", []))
+    custom_caption = settings.get("custom_caption")
+    
+    row = db.execute_query("SELECT user_id FROM user_settings WHERE user_id = %s", (user_id,), fetch="one")
+    if row:
+        db.execute_query(
+            "UPDATE user_settings SET custom_caption = %s, filters = %s, remove_words = %s WHERE user_id = %s",
+            (custom_caption, filters_str, remove_words_str, user_id), commit=True
+        )
+    else:
+        db.execute_query(
+            "INSERT INTO user_settings (user_id, custom_caption, filters, remove_words) VALUES (%s, %s, %s, %s)",
+            (user_id, custom_caption, filters_str, remove_words_str), commit=True
+        )
+
+def get_progress_bar(pct):
+    """Generates a 20-character diamond progress bar string representing progress percentage."""
+    filled = int(round((pct / 100.0) * 20))
+    hollow = 20 - filled
+    return "◆" * filled + "◇" * hollow
+
+async def run_forwarding_task(user_id, source_id, target_chat_id, status_message_id, chat_id):
+    """Background task that runs the forwarding logic from oldest to newest messages."""
+    stats = {
+        "fetched": 0,
+        "forwarded": 0,
+        "duplicates": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "filtered": 0,
+        "status": "Forwarding",
+        "progress": 0
+    }
+    
+    active_forwarding_tasks[user_id] = {
+        "cancelled": False,
+        "stats": stats,
+        "message_id": status_message_id,
+        "chat_id": chat_id
+    }
+    
+    # Retrieve linked bot and userbot details
+    bot_row = db.execute_query("SELECT bot_token FROM linked_bots WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="one")
+    ub_row = db.execute_query("SELECT session_string FROM linked_userbots WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="one")
+    
+    # User settings (caption, filters, remove words)
+    user_settings = get_user_settings(user_id)
+    caption_template = user_settings.get("custom_caption")
+    filters = user_settings.get("filters", {})
+    remove_words = user_settings.get("remove_words", [])
+    
+    # Determine if we run in simulation mode
+    is_simulation = True
+    if ub_row and ub_row[0] and not ub_row[0].startswith("SIMULATED"):
+        is_simulation = False
+        
+    def update_status_message(is_done=False):
+        progress_bar = get_progress_bar(stats["progress"])
+        status_text = "Completed" if is_done else stats["status"]
+        if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
+            status_text = "Cancelled"
+        hourglass_text = "✅ Done" if is_done else "⏳ Processing"
+        
+        text = (
+            "✨ <b>FORWARD STATUS</b>\n\n"
+            "<blockquote>"
+            f"📥 <b>FETCHED:</b> {stats['fetched']}\n"
+            f"📤 <b>FORWARDED:</b> {stats['forwarded']}\n"
+            f"🔄 <b>DUPLICATES:</b> {stats['duplicates']}\n"
+            f"🗑️ <b>DELETED:</b> {stats['deleted']}\n"
+            f"⏭️ <b>SKIPPED:</b> {stats['skipped']}\n"
+            f"🎯 <b>FILTERED:</b> {stats['filtered']}\n"
+            f"⚡ <b>STATUS:</b> {status_text}\n"
+            f"📊 <b>PROGRESS:</b> {stats['progress']}%\n\n"
+            f"✨ {hourglass_text}"
+            "</blockquote>"
+        )
+        
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton(progress_bar, callback_data="progress_bar_click"))
+        if not is_done and status_text == "Forwarding":
+            markup.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel_forward_task"))
+            
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_message_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Error editing status message: {e}")
+
+    if is_simulation:
+        # Run Simulation Mode
+        total_messages = 45
+        import random
+        for i in range(1, total_messages + 1):
+            if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
+                stats["status"] = "Cancelled"
+                update_status_message(is_done=True)
+                return
+                
+            stats["fetched"] += 1
+            rand = random.random()
+            if rand < 0.1:
+                stats["duplicates"] += 1
+            elif rand < 0.15:
+                stats["skipped"] += 1
+            elif rand < 0.2:
+                stats["filtered"] += 1
+            else:
+                stats["forwarded"] += 1
+                
+            stats["progress"] = int((i / total_messages) * 100)
+            update_status_message(is_done=(i == total_messages))
+            await asyncio.sleep(1.0)
+            
+        active_forwarding_tasks.pop(user_id, None)
+    else:
+        # Real Mode using Pyrogram
+        session = ub_row[0]
+        API_ID = os.environ.get("API_ID") or config.get("api_id")
+        API_HASH = os.environ.get("API_HASH") or config.get("api_hash")
+        
+        client = Client(
+            name=f"forwarder_{user_id}",
+            api_id=int(API_ID),
+            api_hash=API_HASH,
+            session_string=session,
+            in_memory=True
+        )
+        
+        try:
+            await client.connect()
+            
+            # Resolve source chat entity (can be ID or username)
+            try:
+                resolved_chat = await client.get_chat(source_id)
+                resolved_chat_id = resolved_chat.id
+            except Exception as e:
+                logger.error(f"Failed to resolve source chat entity: {e}")
+                resolved_chat_id = source_id
+                
+            total = await client.get_chat_history_count(resolved_chat_id)
+            if total == 0:
+                stats["status"] = "Source chat is empty"
+                update_status_message(is_done=True)
+                await client.disconnect()
+                return
+                
+            count = 0
+            async for msg in client.get_chat_history(resolved_chat_id, reverse=True):
+                if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
+                    stats["status"] = "Cancelled"
+                    update_status_message(is_done=True)
+                    break
+                    
+                count += 1
+                stats["fetched"] += 1
+                stats["progress"] = int((count / total) * 100)
+                
+                # Apply Type Filters
+                is_matched = True
+                if msg.text:
+                    if not filters.get("texts", True):
+                        is_matched = False
+                elif msg.document:
+                    if not filters.get("documents", True):
+                        is_matched = False
+                elif msg.video:
+                    if not filters.get("videos", True):
+                        is_matched = False
+                elif msg.photo:
+                    if not filters.get("photos", True):
+                        is_matched = False
+                elif msg.audio:
+                    if not filters.get("audios", True):
+                        is_matched = False
+                elif msg.voice:
+                    if not filters.get("voices", True):
+                        is_matched = False
+                elif msg.animation:
+                    if not filters.get("animations", True):
+                        is_matched = False
+                elif msg.sticker:
+                    if not filters.get("stickers", True):
+                        is_matched = False
+                elif msg.poll:
+                    if not filters.get("poll", True):
+                        is_matched = False
+                else:
+                    # Skip unsupported/service messages
+                    is_matched = False
+                    
+                if not is_matched:
+                    stats["filtered"] += 1
+                    update_status_message(is_done=(count == total))
+                    continue
+                    
+                try:
+                    # Process Caption variables
+                    new_caption = msg.caption or ""
+                    if caption_template and (msg.document or msg.video or msg.photo or msg.audio):
+                        fname = ""
+                        fsize = ""
+                        if msg.document:
+                            fname = msg.document.file_name or "document"
+                            fsize = f"{round(msg.document.file_size / (1024*1024), 2)} MB"
+                        elif msg.video:
+                            fname = msg.video.file_name or "video.mp4"
+                            fsize = f"{round(msg.video.file_size / (1024*1024), 2)} MB"
+                        elif msg.audio:
+                            fname = msg.audio.file_name or "audio.mp3"
+                            fsize = f"{round(msg.audio.file_size / (1024*1024), 2)} MB"
+                            
+                        try:
+                            new_caption = caption_template.format(
+                                filename=fname,
+                                size=fsize,
+                                caption=msg.caption or ""
+                            )
+                        except Exception:
+                            new_caption = msg.caption or ""
+                            
+                    # Remove Words filters
+                    if remove_words:
+                        for word in remove_words:
+                            if new_caption:
+                                new_caption = new_caption.replace(word, "")
+                                
+                    # Send message copy or forward tag
+                    if filters.get("forward_tag", False):
+                        # Forward (shows forwarded from header)
+                        await client.forward_messages(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_ids=msg.id)
+                    else:
+                        # Copy (strips forward tag)
+                        if msg.text:
+                            text_content = msg.text
+                            if remove_words:
+                                for word in remove_words:
+                                    text_content = text_content.replace(word, "")
+                                await client.send_message(chat_id=target_chat_id, text=text_content)
+                            else:
+                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
+                        else:
+                            if new_caption:
+                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id, caption=new_caption)
+                            else:
+                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
+                                
+                    stats["forwarded"] += 1
+                except Exception as fe:
+                    logger.error(f"Failed to forward message {msg.id}: {fe}")
+                    stats["skipped"] += 1
+                    
+                update_status_message(is_done=(count == total))
+                await asyncio.sleep(1.5)
+                
+            await client.disconnect()
+        except Exception as ce:
+            logger.error(f"Pyrogram forwarding execution crash: {ce}")
+            stats["status"] = f"Crash: {str(ce)[:30]}"
+            update_status_message(is_done=True)
+            try:
+                await client.disconnect()
+            except:
+                pass
+                
+        active_forwarding_tasks.pop(user_id, None)
 
 # Default Configurations
 DEFAULT_BUTTON_MESSAGES = {
@@ -548,7 +955,7 @@ def get_bots_settings_markup(user_id):
     )
     # Retrieve linked userbots
     linked_userbots = db.execute_query(
-        "SELECT id, phone FROM linked_userbots WHERE user_id = %s",
+        "SELECT id, phone, first_name, username FROM linked_userbots WHERE user_id = %s",
         (user_id,), fetch="all"
     )
     
@@ -562,8 +969,9 @@ def get_bots_settings_markup(user_id):
             
     # If userbots exist, show them. Otherwise show the add button.
     if linked_userbots:
-        for u_id, phone in linked_userbots:
-            markup.add(InlineKeyboardButton(f"👤 Userbot ({phone})", callback_data=f"manage_userbot_{u_id}"))
+        for u_id, phone, f_name, u_name in linked_userbots:
+            display_name = f"@{u_name}" if u_name else (f_name if f_name else f"👤 Userbot ({phone})")
+            markup.add(InlineKeyboardButton(display_name, callback_data=f"manage_userbot_{u_id}"))
     else:
         markup.add(InlineKeyboardButton("➕ Add User bot ➕", callback_data="settings_bots_userbot"))
             
@@ -731,6 +1139,401 @@ def show_userbot_details_panel(call, u_id):
     except Exception as e:
         logger.error(f"Error editing text to userbot details: {e}")
 
+def get_channels_settings_markup(user_id):
+    """Returns the keyboard layout for the Channels configuration submenu."""
+    markup = InlineKeyboardMarkup()
+    
+    # Retrieve linked target chats
+    target_chats = db.execute_query(
+        "SELECT id, chat_title FROM target_chats WHERE user_id = %s",
+        (user_id,), fetch="all"
+    )
+    
+    # Add buttons for each target chat
+    if target_chats:
+        for c_id, c_title in target_chats:
+            markup.add(InlineKeyboardButton(c_title, callback_data=f"manage_channel_{c_id}"))
+            
+    # Add control button
+    markup.add(InlineKeyboardButton("➕ Add Channel ➕", callback_data="settings_channels_add"))
+    
+    # Back button
+    markup.add(InlineKeyboardButton("back", callback_data="settings_menu"))
+    return markup
+
+def show_channels_settings_panel(call):
+    """Transition to Channels Settings Panel by editing in place."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    text = "<b><u>My Channels</u></b>\n\nyou can manage your target chats in here"
+    markup = get_channels_settings_markup(user_id)
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption to channels panel: {e}")
+            
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error editing text to channels panel: {e}")
+
+def send_channels_settings_panel(chat_id, user_id=None):
+    """Sends the Channels settings panel as a new message (after text flows)."""
+    if user_id is None:
+        user_id = chat_id
+    welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
+    text = "<b><u>My Channels</u></b>\n\nyou can manage your target chats in here"
+    markup = get_channels_settings_markup(user_id)
+    if welcome_photo:
+        try:
+            bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.error(f"Error sending photo for channels settings: {e}")
+            
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+def show_channel_details_panel(call, c_id):
+    """Transition to Channel Details panel where user can view and remove the target chat."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    row = db.execute_query(
+        "SELECT id, chat_title, chat_id, chat_username FROM target_chats WHERE id = %s",
+        (c_id,), fetch="one"
+    )
+    if not row:
+        bot.answer_callback_query(call.id, "❌ Channel not found.", show_alert=True)
+        show_channels_settings_panel(call)
+        return
+        
+    c_id_db, c_title, c_chat_id, c_username = row
+    
+    username_text = f"@{c_username}" if c_username else "None"
+    text = (
+        "🏷️ <b>CHANNEL DETAILS</b>\n\n"
+        "<blockquote>"
+        f"📝 <b>TITLE:</b> {c_title}\n"
+        f"🆔 <b>CHAT ID:</b> {c_chat_id or 'Pending'}\n"
+        f"👤 <b>USERNAME:</b> {username_text}"
+        "</blockquote>"
+    )
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("❌ Remove ❌", callback_data=f"remove_channel_{c_id_db}"))
+    markup.add(InlineKeyboardButton("back", callback_data="settings_channels"))
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption to channel details: {e}")
+            
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error editing text to channel details: {e}")
+
+def show_caption_settings_panel(call):
+    """Transition to Custom Caption Settings panel."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    settings = get_user_settings(user_id)
+    curr_caption = settings.get("custom_caption")
+    caption_status = f"<code>{curr_caption}</code>" if curr_caption else "<i>Not Set (Default Caption)</i>"
+    
+    text = (
+        "<b><u>CUSTOM CAPTION</u></b>\n\n"
+        "You can set a custom caption to videos and documents. Normaly use its default caption\n\n"
+        f"<b>Current Caption:</b>\n{caption_status}\n\n"
+        "<b>AVAILABLE FILLINGS:</b>\n"
+        "- <code>{filename}</code> : Filename\n"
+        "- <code>{size}</code> : File size\n"
+        "- <code>{caption}</code> : default caption"
+    )
+    
+    markup = InlineKeyboardMarkup()
+    if curr_caption:
+        markup.row(
+            InlineKeyboardButton("🖊️ Edit Caption 🖊️", callback_data="settings_caption_add"),
+            InlineKeyboardButton("❌ Remove Caption ❌", callback_data="settings_caption_remove")
+        )
+    else:
+        markup.add(InlineKeyboardButton("➕ Add Caption ➕", callback_data="settings_caption_add"))
+    markup.add(InlineKeyboardButton("back", callback_data="settings_menu"))
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption: {e}")
+            
+    try:
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error editing text: {e}")
+
+def send_caption_settings_panel(chat_id, user_id=None):
+    if user_id is None:
+        user_id = chat_id
+    welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
+    
+    settings = get_user_settings(user_id)
+    curr_caption = settings.get("custom_caption")
+    caption_status = f"<code>{curr_caption}</code>" if curr_caption else "<i>Not Set (Default Caption)</i>"
+    
+    text = (
+        "<b><u>CUSTOM CAPTION</u></b>\n\n"
+        "You can set a custom caption to videos and documents. Normaly use its default caption\n\n"
+        f"<b>Current Caption:</b>\n{caption_status}\n\n"
+        "<b>AVAILABLE FILLINGS:</b>\n"
+        "- <code>{filename}</code> : Filename\n"
+        "- <code>{size}</code> : File size\n"
+        "- <code>{caption}</code> : default caption"
+    )
+    
+    markup = InlineKeyboardMarkup()
+    if curr_caption:
+        markup.row(
+            InlineKeyboardButton("🖊️ Edit Caption 🖊️", callback_data="settings_caption_add"),
+            InlineKeyboardButton("❌ Remove Caption ❌", callback_data="settings_caption_remove")
+        )
+    else:
+        markup.add(InlineKeyboardButton("➕ Add Caption ➕", callback_data="settings_caption_add"))
+    markup.add(InlineKeyboardButton("back", callback_data="settings_menu"))
+    
+    if welcome_photo:
+        try:
+            bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.error(f"Error sending photo: {e}")
+            
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+def get_filters_markup(user_id, page=1):
+    markup = InlineKeyboardMarkup()
+    settings = get_user_settings(user_id)
+    filters = settings.get("filters", {})
+    
+    def get_emoji(val):
+        return "✅" if val else "❌"
+        
+    if page == 1:
+        # 🏷️ Forward tag
+        f_tag = filters.get("forward_tag", False)
+        markup.row(
+            InlineKeyboardButton("🏷️ Forward tag", callback_data="toggle_filter_forward_tag_1"),
+            InlineKeyboardButton(get_emoji(f_tag), callback_data="toggle_filter_forward_tag_1")
+        )
+        # 🖍️ Texts
+        txts = filters.get("texts", True)
+        markup.row(
+            InlineKeyboardButton("🖍️ Texts", callback_data="toggle_filter_texts_1"),
+            InlineKeyboardButton(get_emoji(txts), callback_data="toggle_filter_texts_1")
+        )
+        # 📁 Documents
+        docs = filters.get("documents", True)
+        markup.row(
+            InlineKeyboardButton("📁 Documents", callback_data="toggle_filter_documents_1"),
+            InlineKeyboardButton(get_emoji(docs), callback_data="toggle_filter_documents_1")
+        )
+        # 🎬 Videos
+        vids = filters.get("videos", True)
+        markup.row(
+            InlineKeyboardButton("🎬 Videos", callback_data="toggle_filter_videos_1"),
+            InlineKeyboardButton(get_emoji(vids), callback_data="toggle_filter_videos_1")
+        )
+        # 📷 Photos
+        imgs = filters.get("photos", True)
+        markup.row(
+            InlineKeyboardButton("📷 Photos", callback_data="toggle_filter_photos_1"),
+            InlineKeyboardButton(get_emoji(imgs), callback_data="toggle_filter_photos_1")
+        )
+        # 🎧 Audios
+        auds = filters.get("audios", True)
+        markup.row(
+            InlineKeyboardButton("🎧 Audios", callback_data="toggle_filter_audios_1"),
+            InlineKeyboardButton(get_emoji(auds), callback_data="toggle_filter_audios_1")
+        )
+        
+        markup.row(
+            InlineKeyboardButton("≪ back", callback_data="settings_menu"),
+            InlineKeyboardButton("next ≫", callback_data="settings_filters_page_2")
+        )
+    else:
+        # 🎤 Voices
+        vcs = filters.get("voices", True)
+        markup.row(
+            InlineKeyboardButton("🎤 Voices", callback_data="toggle_filter_voices_2"),
+            InlineKeyboardButton(get_emoji(vcs), callback_data="toggle_filter_voices_2")
+        )
+        # 🎭 Animations
+        anms = filters.get("animations", True)
+        markup.row(
+            InlineKeyboardButton("🎭 Animations", callback_data="toggle_filter_animations_2"),
+            InlineKeyboardButton(get_emoji(anms), callback_data="toggle_filter_animations_2")
+        )
+        # 🃏 Stickers
+        stks = filters.get("stickers", True)
+        markup.row(
+            InlineKeyboardButton("🃏 Stickers", callback_data="toggle_filter_stickers_2"),
+            InlineKeyboardButton(get_emoji(stks), callback_data="toggle_filter_stickers_2")
+        )
+        # ▶️ Skip duplicate
+        skps = filters.get("skip_duplicate", True)
+        markup.row(
+            InlineKeyboardButton("▶️ Skip duplicate", callback_data="toggle_filter_skip_duplicate_2"),
+            InlineKeyboardButton(get_emoji(skps), callback_data="toggle_filter_skip_duplicate_2")
+        )
+        # 📊 Poll
+        plls = filters.get("poll", True)
+        markup.row(
+            InlineKeyboardButton("📊 Poll", callback_data="toggle_filter_poll_2"),
+            InlineKeyboardButton(get_emoji(plls), callback_data="toggle_filter_poll_2")
+        )
+        # 🔒 Secure message
+        scrs = filters.get("secure_message", False)
+        markup.row(
+            InlineKeyboardButton("🔒 Secure message", callback_data="toggle_filter_secure_message_2"),
+            InlineKeyboardButton(get_emoji(scrs), callback_data="toggle_filter_secure_message_2")
+        )
+        
+        markup.row(
+            InlineKeyboardButton("≪ back", callback_data="settings_filters_page_1"),
+            InlineKeyboardButton("End ≫", callback_data="settings_menu")
+        )
+        
+    return markup
+
+def show_filters_settings_panel(call, page=1):
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    text = (
+        "<b>💠 CUSTOM FILTERS 💠</b>\n\n"
+        "<b>configure the type of messages which you want forward</b>"
+    )
+    markup = get_filters_markup(user_id, page)
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption: {e}")
+            
+    try:
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error editing text: {e}")
+
+def get_remove_words_markup():
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("➕ Add Remove Word", callback_data="remove_words_add"))
+    markup.add(InlineKeyboardButton("➖ Delete Remove Word", callback_data="remove_words_delete"))
+    markup.add(InlineKeyboardButton("📋 View Remove Words List", callback_data="remove_words_view"))
+    markup.add(InlineKeyboardButton("🗑️ Clear All Remove Words", callback_data="remove_words_clear"))
+    markup.add(InlineKeyboardButton("◀️ Back to Settings", callback_data="settings_menu"))
+    return markup
+
+def show_remove_words_settings_panel(call):
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    settings = get_user_settings(user_id)
+    words = settings.get("remove_words", [])
+    words_list = ", ".join([f"<code>{w}</code>" for w in words]) if words else "<i>None</i>"
+    
+    text = (
+        "<b>🚫 Remove Words Settings</b>\n\n"
+        "Here you can manage words to remove from post captions.\n\n"
+        f"<b>Active Remove Words:</b> {words_list}"
+    )
+    markup = get_remove_words_markup()
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption: {e}")
+            
+    try:
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error editing text: {e}")
+
+def send_remove_words_settings_panel(chat_id, user_id=None):
+    if user_id is None:
+        user_id = chat_id
+    welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
+    
+    settings = get_user_settings(user_id)
+    words = settings.get("remove_words", [])
+    words_list = ", ".join([f"<code>{w}</code>" for w in words]) if words else "<i>None</i>"
+    
+    text = (
+        "<b>🚫 Remove Words Settings</b>\n\n"
+        "Here you can manage words to remove from post captions.\n\n"
+        f"<b>Active Remove Words:</b> {words_list}"
+    )
+    markup = get_remove_words_markup()
+    
+    if welcome_photo:
+        try:
+            bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.error(f"Error sending photo: {e}")
+            
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
 def show_admin_intro_menu(chat_id):
     welcome_photo = config.get("welcome_photo", "None")
     welcome_text = config.get("welcome_text", "")
@@ -858,15 +1661,52 @@ def cmd_myid(message):
         parse_mode="HTML"
     )
 
+@bot.message_handler(commands=["forward"])
+def cmd_forward(message):
+    """Initiates the forwarding wizard process."""
+    user_id = message.from_user.id
+    
+    # Check if they have target chats configured first
+    targets = db.execute_query("SELECT id FROM target_chats WHERE user_id = %s", (user_id,), fetch="all")
+    if not targets:
+        bot.reply_to(
+            message,
+            "❌ <b>No Target Channels Configured!</b>\n\n"
+            "Please add at least one target channel/group in the Settings ➔ Channels menu first before initiating a forward.",
+            parse_mode="HTML"
+        )
+        return
+        
+    # Check if they already have an active forwarding task running
+    if user_id in active_forwarding_tasks:
+        bot.reply_to(
+            message,
+            "❌ <b>Active Forwarding Task Already Running!</b>\n\n"
+            "Please wait for the active forwarding task to complete or cancel it first.",
+            parse_mode="HTML"
+        )
+        return
+        
+    user_states[user_id] = "WAITING_FOR_SOURCE_CHAT"
+    
+    text = (
+        "📤 <b>SET SOURCE CHAT</b>\n\n"
+        "<blockquote>"
+        "FORWARD THE LAST MESSAGE OR LAST MESSAGE LINK OF SOURCE CHAT\n\n"
+        "/cancel - CANCEL THIS PROCESS"
+        "</blockquote>"
+    )
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
 # --- STATE-BASED MESSAGE HANDLER ---
-@bot.message_handler(content_types=['text', 'photo'], func=lambda msg: msg.from_user.id in user_states and user_states[msg.from_user.id] is not None)
+@bot.message_handler(content_types=['text', 'photo', 'audio', 'document', 'video', 'video_note', 'voice', 'location', 'contact', 'sticker'], func=lambda msg: msg.from_user.id in user_states and user_states[msg.from_user.id] is not None)
 def handle_admin_inputs(message):
     """Processes incoming text and media from admins based on active editing states."""
     user_id = message.from_user.id
     state = user_states.get(user_id)
     
     # Allow users to complete the custom bot/userbot wizards, but restrict introductory configs to admins
-    if not is_admin(user_id) and state not in ["WAITING_FOR_BOT_TOKEN", "WAITING_FOR_PHONE", "WAITING_FOR_CODE", "WAITING_FOR_2FA"]:
+    if not is_admin(user_id) and state not in ["WAITING_FOR_BOT_TOKEN", "WAITING_FOR_PHONE", "WAITING_FOR_CODE", "WAITING_FOR_2FA", "WAITING_FOR_TARGET_CHAT", "WAITING_FOR_CUSTOM_CAPTION", "WAITING_FOR_REMOVE_WORD", "WAITING_FOR_DELETE_REMOVE_WORD", "WAITING_FOR_SOURCE_CHAT"]:
         user_states[user_id] = None
         return
         
@@ -1071,9 +1911,11 @@ def handle_admin_inputs(message):
             sim_session = f"SIMULATED_SESSION_STRING_FOR_{phone}_{code}"
             
             try:
+                sim_first_name = "Simulated User"
+                sim_username = f"sim_user_{phone.replace('+', '')}"
                 db.execute_query(
-                    "INSERT INTO linked_userbots (user_id, phone, session_string) VALUES (%s, %s, %s)",
-                    (user_id, phone, sim_session), commit=True
+                    "INSERT INTO linked_userbots (user_id, phone, session_string, first_name, username) VALUES (%s, %s, %s, %s, %s)",
+                    (user_id, phone, sim_session, sim_first_name, sim_username), commit=True
                 )
                 temp_userbot_logins.pop(user_id, None)
                 user_states[user_id] = None
@@ -1115,14 +1957,16 @@ def handle_admin_inputs(message):
                     )
                 else:
                     # Successfully authenticated
-                    async def get_session():
-                        return await client.export_session_string()
-                    session_string = run_async(get_session())
+                    async def get_session_and_me():
+                        session = await client.export_session_string()
+                        me = await client.get_me()
+                        return session, me.first_name, me.username
+                    session_string, first_name, username = run_async(get_session_and_me())
                     
                     # Save to DB
                     db.execute_query(
-                        "INSERT INTO linked_userbots (user_id, phone, session_string) VALUES (%s, %s, %s)",
-                        (user_id, phone, session_string), commit=True
+                        "INSERT INTO linked_userbots (user_id, phone, session_string, first_name, username) VALUES (%s, %s, %s, %s, %s)",
+                        (user_id, phone, session_string, first_name, username), commit=True
                     )
                     
                     # Disconnect temp client
@@ -1170,16 +2014,18 @@ def handle_admin_inputs(message):
         
         bot.reply_to(message, "⏳ <b>Verifying cloud password...</b>", parse_mode="HTML")
         
-        async def check_password_and_export():
+        async def check_password_export_and_me():
             await client.check_password(password)
-            return await client.export_session_string()
+            session = await client.export_session_string()
+            me = await client.get_me()
+            return session, me.first_name, me.username
             
         try:
-            session_string = run_async(check_password_and_export())
+            session_string, first_name, username = run_async(check_password_export_and_me())
             # Save to DB
             db.execute_query(
-                "INSERT INTO linked_userbots (user_id, phone, session_string) VALUES (%s, %s, %s)",
-                (user_id, phone, session_string), commit=True
+                "INSERT INTO linked_userbots (user_id, phone, session_string, first_name, username) VALUES (%s, %s, %s, %s, %s)",
+                (user_id, phone, session_string, first_name, username), commit=True
             )
             
             # Disconnect temp client
@@ -1228,6 +2074,226 @@ def handle_admin_inputs(message):
         
         bot.reply_to(message, "✅ <b>Button Response Message Updated Successfully!</b>", parse_mode="HTML")
         show_admin_buttons_menu(message.chat.id)
+        
+    elif state == "WAITING_FOR_TARGET_CHAT":
+        # Check for cancel command or text
+        if message.text and message.text.strip().lower() == "/cancel":
+            user_states[user_id] = None
+            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            send_channels_settings_panel(message.chat.id, user_id)
+            return
+
+        target_id = None
+        target_title = None
+        target_username = None
+        
+        if message.forward_from_chat:
+            target_id = message.forward_from_chat.id
+            target_title = message.forward_from_chat.title
+            target_username = message.forward_from_chat.username
+        elif message.text:
+            text = message.text.strip()
+            # Handle direct numeric ID (e.g. -100123456789)
+            if (text.startswith("-") and text[1:].isdigit()) or text.isdigit():
+                target_id = int(text)
+                target_title = f"Chat {target_id}"
+            elif text.startswith("@"):
+                target_username = text[1:]
+                target_title = text
+                
+        if target_id is not None or target_username is not None:
+            try:
+                db.execute_query(
+                    "INSERT INTO target_chats (user_id, chat_id, chat_title, chat_username) VALUES (%s, %s, %s, %s)",
+                    (user_id, target_id, target_title or f"@{target_username}", target_username), commit=True
+                )
+                user_states[user_id] = None
+                bot.reply_to(
+                    message,
+                    f"✅ <b>Target Chat Added Successfully!</b>\n\n"
+                    f"• Title: {target_title or f'@{target_username}'}\n"
+                    f"• ID: <code>{target_id or 'Pending'}</code>",
+                    parse_mode="HTML"
+                )
+                send_channels_settings_panel(message.chat.id, user_id)
+            except Exception as e:
+                logger.error(f"Error saving target chat to DB: {e}")
+                bot.reply_to(message, f"❌ Failed to save target chat: <code>{e}</code>", parse_mode="HTML")
+                user_states[user_id] = None
+                send_channels_settings_panel(message.chat.id, user_id)
+        else:
+            bot.reply_to(
+                message,
+                "❌ <b>Invalid Input</b>\n"
+                "Please forward a message from your target chat, or type `/cancel` to abort.",
+                parse_mode="HTML"
+            )
+            
+    elif state == "WAITING_FOR_CUSTOM_CAPTION":
+        if message.text and message.text.strip().lower() == "/cancel":
+            user_states[user_id] = None
+            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            send_caption_settings_panel(message.chat.id, user_id)
+            return
+            
+        if not message.text:
+            bot.reply_to(message, "❌ Please send a text caption or type `/cancel` to abort.")
+            return
+            
+        new_caption = message.text.strip()
+        settings = get_user_settings(user_id)
+        settings["custom_caption"] = new_caption
+        save_user_settings(user_id, settings)
+        
+        user_states[user_id] = None
+        bot.reply_to(message, "✅ <b>Custom Caption updated successfully!</b>", parse_mode="HTML")
+        send_caption_settings_panel(message.chat.id, user_id)
+        
+    elif state == "WAITING_FOR_REMOVE_WORD":
+        if message.text and message.text.strip().lower() == "/cancel":
+            user_states[user_id] = None
+            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            send_remove_words_settings_panel(message.chat.id, user_id)
+            return
+            
+        if not message.text:
+            bot.reply_to(message, "❌ Please send the word(s) to remove or type `/cancel` to abort.")
+            return
+            
+        input_text = message.text.strip()
+        new_words = [w.strip() for w in input_text.split(",") if w.strip()]
+        
+        settings = get_user_settings(user_id)
+        existing_words = settings.get("remove_words", [])
+        
+        added_count = 0
+        for w in new_words:
+            if w not in existing_words:
+                existing_words.append(w)
+                added_count += 1
+                
+        settings["remove_words"] = existing_words
+        save_user_settings(user_id, settings)
+        
+        user_states[user_id] = None
+        bot.reply_to(message, f"✅ <b>Added {added_count} word(s) to remove list!</b>", parse_mode="HTML")
+        send_remove_words_settings_panel(message.chat.id, user_id)
+        
+    elif state == "WAITING_FOR_DELETE_REMOVE_WORD":
+        if message.text and message.text.strip().lower() == "/cancel":
+            user_states[user_id] = None
+            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            send_remove_words_settings_panel(message.chat.id, user_id)
+            return
+            
+        if not message.text:
+            bot.reply_to(message, "❌ Please send the word to delete or type `/cancel` to abort.")
+            return
+            
+        word_to_delete = message.text.strip()
+        settings = get_user_settings(user_id)
+        existing_words = settings.get("remove_words", [])
+        
+        if word_to_delete in existing_words:
+            existing_words.remove(word_to_delete)
+            settings["remove_words"] = existing_words
+            save_user_settings(user_id, settings)
+            bot.reply_to(message, f"✅ <b>Word '<code>{word_to_delete}</code>' deleted from remove list!</b>", parse_mode="HTML")
+        else:
+            bot.reply_to(message, f"❌ <b>Word '<code>{word_to_delete}</code>' not found in your list.</b>", parse_mode="HTML")
+            
+        user_states[user_id] = None
+        send_remove_words_settings_panel(message.chat.id, user_id)
+        
+    elif state == "WAITING_FOR_SOURCE_CHAT":
+        if message.text and message.text.strip().lower() == "/cancel":
+            user_states[user_id] = None
+            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            return
+            
+        source_id = None
+        source_title = None
+        
+        if message.forward_from_chat:
+            source_id = message.forward_from_chat.id
+            source_title = message.forward_from_chat.title or message.forward_from_chat.username or "Source Chat"
+        elif message.text:
+            text = message.text.strip()
+            import re
+            link_match = re.search(r"t\.me/(c/)?([^/]+)/(\d+)", text)
+            if link_match:
+                is_private = link_match.group(1) is not None
+                chat_identifier = link_match.group(2)
+                if is_private:
+                    source_id = int(f"-100{chat_identifier}")
+                    source_title = "private"
+                else:
+                    source_id = f"@{chat_identifier}"
+                    source_title = f"@{chat_identifier}"
+            else:
+                if (text.startswith("-") and text[1:].isdigit()) or text.isdigit():
+                    source_id = int(text)
+                    source_title = f"Chat {source_id}"
+                elif text.startswith("@"):
+                    source_id = text
+                    source_title = text
+                    
+        if source_id is not None:
+            user_states[user_id] = None
+            targets = db.execute_query("SELECT chat_id, chat_title FROM target_chats WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="all")
+            bots = db.execute_query("SELECT bot_name, bot_username FROM linked_bots WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="all")
+            userbots = db.execute_query("SELECT username, phone FROM linked_userbots WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="all")
+            
+            if not targets:
+                bot.reply_to(message, "❌ No target chats configured. Please configure a target chat first.", parse_mode="HTML")
+                return
+                
+            target_chat_id, target_title = targets[0]
+            
+            bot_display = "Bot"
+            if bots:
+                bot_display = bots[0][0] or f"@{bots[0][1]}"
+            elif userbots:
+                bot_display = userbots[0][0] or userbots[0][1]
+                
+            temp_forward_confirms[user_id] = {
+                "source_id": source_id,
+                "source_title": source_title,
+                "target_chat_id": target_chat_id,
+                "target_title": target_title,
+                "bot_display": bot_display
+            }
+            
+            check_text = (
+                "⚠️ <b>DOUBLE CHECK</b>\n\n"
+                "<blockquote>"
+                "PLEASE VERIFY THE FOLLOWING DETAILS:\n\n"
+                f"🤖 <b>BOT:</b> {bot_display}\n"
+                f"📤 <b>FROM:</b> {source_title}\n"
+                f"📥 <b>TO:</b> {target_title}\n"
+                "⏭️ <b>SKIP:</b> 0\n\n"
+                "📌 <b>IMPORTANT:</b>\n"
+                f"• {bot_display} MUST BE ADMIN IN TARGET CHAT\n"
+                "• FOR PRIVATE SOURCE, BOT NEEDS ADMIN\n"
+                "OR USERBOT MUST BE MEMBER"
+                "</blockquote>\n\n"
+                "✅ <i>CLICK YES IF EVERYTHING IS CORRECT</i>"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            markup.row(
+                InlineKeyboardButton("Yes", callback_data="confirm_forward_yes"),
+                InlineKeyboardButton("No", callback_data="confirm_forward_no")
+            )
+            
+            bot.send_message(message.chat.id, check_text, reply_markup=markup, parse_mode="HTML")
+        else:
+            bot.reply_to(
+                message,
+                "❌ <b>Invalid Source Chat</b>\n"
+                "Please forward a message from the source chat, send a message link, or type `/cancel` to abort.",
+                parse_mode="HTML"
+            )
 
 # --- CALLBACK QUERY HANDLERS ---
 @bot.callback_query_handler(func=lambda call: True)
@@ -1289,6 +2355,56 @@ def handle_callbacks(call):
         elif data == "settings_menu":
             bot.answer_callback_query(call.id)
             show_settings_panel(call)
+        elif data == "settings_channels":
+            bot.answer_callback_query(call.id)
+            show_channels_settings_panel(call)
+        elif data == "settings_channels_add":
+            bot.answer_callback_query(call.id)
+            user_states[user_id] = "WAITING_FOR_TARGET_CHAT"
+            bot.send_message(
+                chat_id,
+                "<b>( SET TARGET CHAT )</b>\n\n"
+                "Forward a message from Your target chat\n"
+                "/cancel - cancel this process",
+                parse_mode="HTML"
+            )
+        elif data == "settings_caption":
+            bot.answer_callback_query(call.id)
+            show_caption_settings_panel(call)
+        elif data == "settings_caption_add":
+            bot.answer_callback_query(call.id)
+            user_states[user_id] = "WAITING_FOR_CUSTOM_CAPTION"
+            bot.send_message(
+                chat_id,
+                "🖊️ <b>Add/Edit Custom Caption</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Please send the new custom caption.\n\n"
+                "You can use:\n"
+                "- <code>{filename}</code> : Filename\n"
+                "- <code>{size}</code> : File size\n"
+                "- <code>{caption}</code> : Default caption\n\n"
+                "Type /cancel to abort.",
+                reply_markup=get_cancel_markup(),
+                parse_mode="HTML"
+            )
+        elif data == "settings_caption_remove":
+            bot.answer_callback_query(call.id, "✅ Custom caption removed!", show_alert=True)
+            settings = get_user_settings(user_id)
+            settings["custom_caption"] = None
+            save_user_settings(user_id, settings)
+            show_caption_settings_panel(call)
+        elif data == "settings_filters":
+            bot.answer_callback_query(call.id)
+            show_filters_settings_panel(call, 1)
+        elif data == "settings_filters_page_1":
+            bot.answer_callback_query(call.id)
+            show_filters_settings_panel(call, 1)
+        elif data == "settings_filters_page_2":
+            bot.answer_callback_query(call.id)
+            show_filters_settings_panel(call, 2)
+        elif data == "settings_remove_words":
+            bot.answer_callback_query(call.id)
+            show_remove_words_settings_panel(call)
         else:
             option_name = data.replace("settings_", "").replace("_", " ").title()
             bot.answer_callback_query(
@@ -1327,6 +2443,155 @@ def handle_callbacks(call):
             logger.error(f"Error removing userbot from DB: {e}")
             bot.answer_callback_query(call.id, "❌ Error removing userbot.", show_alert=True)
         show_bots_settings_panel(call)
+            
+    # ─── CHANNELS MANAGEMENT CALLBACKS ───
+    elif data.startswith("manage_channel_"):
+        bot.answer_callback_query(call.id)
+        c_id = int(data.replace("manage_channel_", ""))
+        show_channel_details_panel(call, c_id)
+        
+    elif data.startswith("remove_channel_"):
+        c_id = int(data.replace("remove_channel_", ""))
+        try:
+            db.execute_query("DELETE FROM target_chats WHERE id = %s", (c_id,), commit=True)
+            bot.answer_callback_query(call.id, "✅ Channel removed successfully!", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error removing channel from DB: {e}")
+            bot.answer_callback_query(call.id, "❌ Error removing channel.", show_alert=True)
+        show_channels_settings_panel(call)
+            
+    # ─── REMOVE WORDS CALLBACKS ───
+    elif data.startswith("remove_words_"):
+        bot.answer_callback_query(call.id)
+        action = data.replace("remove_words_", "")
+        
+        if action == "add":
+            user_states[user_id] = "WAITING_FOR_REMOVE_WORD"
+            bot.send_message(
+                chat_id,
+                "🚫 <b>Add Remove Word(s)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Please send the word (or comma-separated list of words) you want to remove from post captions.\n\n"
+                "Type /cancel to abort.",
+                reply_markup=get_cancel_markup(),
+                parse_mode="HTML"
+            )
+        elif action == "delete":
+            user_states[user_id] = "WAITING_FOR_DELETE_REMOVE_WORD"
+            bot.send_message(
+                chat_id,
+                "🚫 <b>Delete Remove Word</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Please send the exact word you want to delete from your remove list.\n\n"
+                "Type /cancel to abort.",
+                reply_markup=get_cancel_markup(),
+                parse_mode="HTML"
+            )
+        elif action == "view":
+            settings = get_user_settings(user_id)
+            words = settings.get("remove_words", [])
+            if not words:
+                bot.send_message(chat_id, "ℹ️ <b>Your remove words list is empty.</b>", parse_mode="HTML")
+            else:
+                words_list = "\n".join([f"• <code>{w}</code>" for w in words])
+                bot.send_message(
+                    chat_id,
+                    "📋 <b>Your Remove Words List:</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{words_list}",
+                    parse_mode="HTML"
+                )
+        elif action == "clear":
+            settings = get_user_settings(user_id)
+            settings["remove_words"] = []
+            save_user_settings(user_id, settings)
+            bot.send_message(chat_id, "🗑️ <b>All remove words cleared!</b>", parse_mode="HTML")
+            show_remove_words_settings_panel(call)
+            
+    # ─── TOGGLE FILTER CALLBACKS ───
+    elif data.startswith("toggle_filter_"):
+        bot.answer_callback_query(call.id)
+        parts = data.replace("toggle_filter_", "").split("_")
+        page = int(parts[-1])
+        key = "_".join(parts[:-1])
+        
+        settings = get_user_settings(user_id)
+        filters = settings.get("filters", {})
+        filters[key] = not filters.get(key, False)
+        settings["filters"] = filters
+        save_user_settings(user_id, settings)
+        
+        show_filters_settings_panel(call, page)
+        
+    # ─── FORWARDING CALLBACKS ───
+    elif data == "confirm_forward_yes":
+        confirm_data = temp_forward_confirms.pop(user_id, None)
+        if not confirm_data:
+            bot.answer_callback_query(call.id, "❌ No pending forwarding confirmation found.", show_alert=True)
+            return
+            
+        bot.answer_callback_query(call.id, "✅ Starting forwarding...")
+        
+        # Send initial Forward Status message
+        initial_text = (
+            "✨ <b>FORWARD STATUS</b>\n\n"
+            "<blockquote>"
+            "📥 <b>FETCHED:</b> 0\n"
+            "📤 <b>FORWARDED:</b> 0\n"
+            "🔄 <b>DUPLICATES:</b> 0\n"
+            "🗑️ <b>DELETED:</b> 0\n"
+            "⏭️ <b>SKIPPED:</b> 0\n"
+            "🎯 <b>FILTERED:</b> 0\n"
+            "⚡ <b>STATUS:</b> Forwarding\n"
+            "📊 <b>PROGRESS:</b> 0%\n\n"
+            "✨ ⏳ Processing"
+            "</blockquote>"
+         )
+        
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("◇" * 20, callback_data="progress_bar_click"))
+        markup.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel_forward_task"))
+        
+        try:
+            status_msg = bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=initial_text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+        except Exception:
+            status_msg = bot.send_message(chat_id, initial_text, reply_markup=markup, parse_mode="HTML")
+            
+        # Launch background forwarding task
+        asyncio.run_coroutine_threadsafe(
+            run_forwarding_task(
+                user_id=user_id,
+                source_id=confirm_data["source_id"],
+                target_chat_id=confirm_data["target_chat_id"],
+                status_message_id=status_msg.message_id,
+                chat_id=chat_id
+            ),
+            background_loop
+        )
+        
+    elif data == "confirm_forward_no":
+        temp_forward_confirms.pop(user_id, None)
+        bot.answer_callback_query(call.id, "❌ Forwarding cancelled.")
+        try:
+            bot.delete_message(chat_id, call.message.message_id)
+        except Exception:
+            pass
+            
+    elif data == "cancel_forward_task":
+        if user_id in active_forwarding_tasks:
+            active_forwarding_tasks[user_id]["cancelled"] = True
+            bot.answer_callback_query(call.id, "🛑 Cancelling forwarding task...", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "❌ No active forwarding task found.", show_alert=True)
+            
+    elif data == "progress_bar_click":
+        bot.answer_callback_query(call.id)
             
     # ─── ADMIN BUTTON CALLBACKS ───
     elif data.startswith("admin_"):
@@ -1440,6 +2705,12 @@ def handle_callbacks(call):
                     show_admin_buttons_menu(chat_id)
                 elif current_state in ["WAITING_FOR_BOT_TOKEN", "WAITING_FOR_PHONE", "WAITING_FOR_CODE", "WAITING_FOR_2FA"]:
                     send_bots_settings_panel(chat_id)
+                elif current_state == "WAITING_FOR_TARGET_CHAT":
+                    send_channels_settings_panel(chat_id)
+                elif current_state == "WAITING_FOR_CUSTOM_CAPTION":
+                    send_caption_settings_panel(chat_id)
+                elif current_state in ["WAITING_FOR_REMOVE_WORD", "WAITING_FOR_DELETE_REMOVE_WORD"]:
+                    send_remove_words_settings_panel(chat_id)
                 else:
                     show_admin_intro_menu(chat_id)
             else:
@@ -1459,7 +2730,7 @@ if __name__ == "__main__":
         # allowing them to see this prompt in logs.
     else:
         logger.info("Bot successfully initialized.")
-        logger.info("Commands available: /start, /admin, /myid")
+        logger.info("Commands available: /start, /admin, /myid, /forward")
         
     try:
         # Start the bot in non-stop polling mode
