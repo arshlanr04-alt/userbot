@@ -18,15 +18,57 @@ logger = logging.getLogger(__name__)
 CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
+DEFAULT_BUTTON_MESSAGES = {
+    "user_help": (
+        "📚 <b>Help Menu</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        "Here are the instructions on how to use the bot:\n"
+        "1. Connect your source channels using Settings.\n"
+        "2. Configure forward filters for custom keywords.\n"
+        "3. Enable status reporting to track deliveries.\n\n"
+        "Need further assistance? Contact support at @AdminSupport."
+    ),
+    "user_about": (
+        "ℹ️ <b>About This Bot</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        "This is an <b>Advanced Forward Bot</b> designed to mirror and redirect content between chats with customization filters.\n\n"
+        "• Version: <code>v2.1.0</code>\n"
+        "• Engine: <code>pyTelegramBotAPI</code>\n"
+        "• Features: Instant delivery, regex filters, caption editor."
+    ),
+    "user_settings": (
+        "⚙️ <b>Bot Settings</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        "Configure your bot parameters below:\n"
+        "• Delay: <code>Disabled (Instant)</code>\n"
+        "• Anti-Spam: <code>Active</code>\n"
+        "• Forward Signature: <code>Off</code>\n\n"
+        "<i>To change settings, use the /settings chat command.</i>"
+    ),
+    "user_status": (
+        "📊 <b>System Status</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        "• Bot Server: 🟢 <code>ONLINE</code>\n"
+        "• Database Conn: 🟢 <code>CONNECTED</code>\n"
+        "• Processed Jobs: <code>1,245 forwards</code>\n"
+        "• Memory Usage: <code>45 MB</code>"
+    ),
+    "user_how_to_use": (
+        "🔗 <b>How to Use Guide</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        "Check out our interactive tutorial:\n"
+        "1. Add the bot to your target channel as Admin.\n"
+        "2. Send the channel ID or link to the bot.\n"
+        "3. Use the forwarding wizard to link source and destination.\n\n"
+        "Read the complete guide on GitHub: <a href='https://github.com'>Advanced-Forward-Bot-Wiki</a>"
+    )
+}
+
 DEFAULT_CONFIG = {
     "bot_token": "YOUR_BOT_TOKEN_HERE",
     "admin_ids": [],
     "welcome_text": (
-        "✨ HI {name} WELCOME TO OUR BOT 👋\n\n"
-        "🎯 <b>I'M AN ADVANCED FORWARD BOT\nWITH SPECIAL FEATURES</b>\n\n"
-        "⚡ <i>CLICK THE BUTTONS BELOW TO\nEXPLORE MORE</i>"
+        "✨ HI {name} WELCOME TO OUR BOT 👋\n"
+        "<blockquote>🎯 <b>I'M AN ADVANCED FORWARD BOT WITH SPECIAL FEATURES</b>\n\n"
+        "⚡ <i>CLICK THE BUTTONS BELOW TO EXPLORE MORE</i></blockquote>"
     ),
-    "welcome_photo": "https://picsum.photos/800/500"  # High quality random placeholder
+    "welcome_photo": "https://picsum.photos/800/500",  # High quality random placeholder
+    "button_messages": DEFAULT_BUTTON_MESSAGES
 }
 
 # --- CONFIG MANAGEMENT ---
@@ -51,6 +93,23 @@ def load_config():
                 if k not in config:
                     config[k] = v
                     updated = True
+            
+            # Ensure button messages exist
+            if "button_messages" not in config:
+                config["button_messages"] = DEFAULT_CONFIG["button_messages"]
+                updated = True
+            else:
+                for kb, vb in DEFAULT_CONFIG["button_messages"].items():
+                    if kb not in config["button_messages"]:
+                        config["button_messages"][kb] = vb
+                        updated = True
+                        
+            # Fix welcome message default text if it has no blockquote and is still using the old default
+            old_default_match = "✨ HI {name} WELCOME TO OUR BOT 👋\n\n🎯 <b>I'M AN ADVANCED FORWARD BOT"
+            if config.get("welcome_text", "").startswith(old_default_match):
+                config["welcome_text"] = DEFAULT_CONFIG["welcome_text"]
+                updated = True
+                
             if updated:
                 save_config(config)
             return config
@@ -155,11 +214,11 @@ def get_user_welcome_markup(user_id):
     return markup
 
 def get_admin_panel_markup():
-    """Returns the admin control panel inline keyboard."""
+    """Returns the main admin control panel inline keyboard."""
     markup = InlineKeyboardMarkup()
     markup.row(
-        InlineKeyboardButton("📝 Edit Text", callback_data="admin_edit_text"),
-        InlineKeyboardButton("🖼️ Edit Photo", callback_data="admin_edit_photo")
+        InlineKeyboardButton("🏠 Intro Panel Settings", callback_data="admin_intro_menu"),
+        InlineKeyboardButton("🔘 Button Response Messages", callback_data="admin_buttons_menu")
     )
     markup.row(
         InlineKeyboardButton("👁️ Preview Welcome", callback_data="admin_preview"),
@@ -167,11 +226,63 @@ def get_admin_panel_markup():
     )
     return markup
 
+def get_admin_intro_markup():
+    """Returns the intro panel configuration inline keyboard."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("📝 Edit Intro Text", callback_data="admin_edit_text"),
+        InlineKeyboardButton("🖼️ Edit Intro Photo", callback_data="admin_edit_photo")
+    )
+    markup.add(InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu"))
+    return markup
+
+def get_admin_buttons_markup():
+    """Returns the inline keyboard for editing response messages for user buttons."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("📚 Help Message", callback_data="admin_edit_btn_user_help"),
+        InlineKeyboardButton("ℹ️ About Message", callback_data="admin_edit_btn_user_about")
+    )
+    markup.row(
+        InlineKeyboardButton("⚙️ Settings Message", callback_data="admin_edit_btn_user_settings"),
+        InlineKeyboardButton("📊 Status Message", callback_data="admin_edit_btn_user_status")
+    )
+    markup.row(
+        InlineKeyboardButton("🔗 Edit How to Use Msg", callback_data="admin_edit_btn_user_how_to_use")
+    )
+    markup.add(InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu"))
+    return markup
+
 def get_cancel_markup():
     """Returns a cancel button for admin operations."""
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel"))
     return markup
+
+def show_admin_intro_menu(chat_id):
+    welcome_photo = config.get("welcome_photo", "None")
+    welcome_text = config.get("welcome_text", "")
+    
+    admin_msg = (
+        "🏠 <b>INTRO PANEL CONFIGURATION</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Manage the welcome text and image shown to users on /start.\n\n"
+        f"🖼️ <b>Current Photo:</b>\n"
+        f"<code>{welcome_photo[:60] + '...' if len(str(welcome_photo)) > 60 else welcome_photo}</code>\n\n"
+        f"📝 <b>Current Text:</b>\n"
+        f"{welcome_text}\n\n"
+        "💡 Use the buttons below to modify:"
+    )
+    bot.send_message(chat_id, admin_msg, reply_markup=get_admin_intro_markup(), parse_mode="HTML")
+
+def show_admin_buttons_menu(chat_id):
+    btn_msg = (
+        "🔘 <b>BUTTON RESPONSE MESSAGES</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Select a button below to configure the message sent when a user clicks it.\n"
+        "All response messages support HTML formatting (bold, italic, quote, etc.)."
+    )
+    bot.send_message(chat_id, btn_msg, reply_markup=get_admin_buttons_markup(), parse_mode="HTML")
 
 # --- CORE SENDER ---
 def send_welcome_message(chat_id, user):
@@ -249,19 +360,11 @@ def cmd_admin(message):
         logger.warning(f"Unauthorized admin access attempt by User ID {user_id}")
         return
     
-    # Show Admin Control Panel
-    welcome_photo = config.get("welcome_photo", "None")
-    welcome_text = config.get("welcome_text", "")
-    
     admin_msg = (
         "👑 <b>ADMIN CONTROL PANEL</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Manage how your bot is displayed to users.\n\n"
-        f"🖼️ <b>Current Photo:</b>\n"
-        f"<code>{welcome_photo[:60] + '...' if len(str(welcome_photo)) > 60 else welcome_photo}</code>\n\n"
-        f"📝 <b>Current Text:</b>\n"
-        f"<blockquote>{welcome_text}</blockquote>\n\n"
-        "💡 Use the buttons below to modify settings:"
+        "💡 Select a module below to configure settings:"
     )
     
     bot.send_message(
@@ -284,7 +387,7 @@ def cmd_myid(message):
     )
 
 # --- STATE-BASED MESSAGE HANDLER ---
-@bot.message_handler(func=lambda msg: msg.from_user.id in user_states and user_states[msg.from_user.id] is not None)
+@bot.message_handler(content_types=['text', 'photo'], func=lambda msg: msg.from_user.id in user_states and user_states[msg.from_user.id] is not None)
 def handle_admin_inputs(message):
     """Processes incoming text and media from admins based on active editing states."""
     user_id = message.from_user.id
@@ -306,8 +409,7 @@ def handle_admin_inputs(message):
         user_states[user_id] = None
         
         bot.reply_to(message, "✅ <b>Welcome Text Updated Successfully!</b>", parse_mode="HTML")
-        # Redisplay admin panel
-        cmd_admin(message)
+        show_admin_intro_menu(message.chat.id)
         
     elif state == "WAITING_FOR_PHOTO":
         # Check if the user sent a photo
@@ -319,7 +421,7 @@ def handle_admin_inputs(message):
             user_states[user_id] = None
             
             bot.reply_to(message, "✅ <b>Welcome Photo Updated (using Telegram File ID)!</b>", parse_mode="HTML")
-            cmd_admin(message)
+            show_admin_intro_menu(message.chat.id)
             
         # Check if they sent a text (assumed to be a URL)
         elif message.text:
@@ -331,7 +433,7 @@ def handle_admin_inputs(message):
                 user_states[user_id] = None
                 
                 bot.reply_to(message, "✅ <b>Welcome Photo Updated (using URL)!</b>", parse_mode="HTML")
-                cmd_admin(message)
+                show_admin_intro_menu(message.chat.id)
             else:
                 bot.reply_to(
                     message, 
@@ -342,6 +444,21 @@ def handle_admin_inputs(message):
                 )
         else:
             bot.reply_to(message, "❌ Please upload a photo or send a photo URL.", reply_markup=get_cancel_markup())
+            
+    elif state.startswith("WAITING_FOR_BTN_"):
+        btn_key = state.replace("WAITING_FOR_BTN_", "")
+        if not message.text:
+            bot.reply_to(message, "❌ Please send text only for the button response message.", reply_markup=get_cancel_markup())
+            return
+            
+        if "button_messages" not in config:
+            config["button_messages"] = {}
+        config["button_messages"][btn_key] = message.text
+        save_config(config)
+        user_states[user_id] = None
+        
+        bot.reply_to(message, "✅ <b>Button Response Message Updated Successfully!</b>", parse_mode="HTML")
+        show_admin_buttons_menu(message.chat.id)
 
 # --- CALLBACK QUERY HANDLERS ---
 @bot.callback_query_handler(func=lambda call: True)
@@ -353,56 +470,15 @@ def handle_callbacks(call):
     
     # ─── USER BUTTON CALLBACKS ───
     if data.startswith("user_"):
-        # Answer to clear the loading spinner on Telegram client
         bot.answer_callback_query(call.id)
         
-        button_name = data.replace("user_", "").replace("_", " ").title()
+        button_messages = config.get("button_messages", DEFAULT_CONFIG["button_messages"])
+        response_text = button_messages.get(data)
         
-        # Friendly response messages for the core user buttons
-        response_texts = {
-            "user_help": (
-                "📚 <b>Help Menu</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                "Here are the instructions on how to use the bot:\n"
-                "1. Connect your source channels using Settings.\n"
-                "2. Configure forward filters for custom keywords.\n"
-                "3. Enable status reporting to track deliveries.\n\n"
-                "Need further assistance? Contact support at @AdminSupport."
-            ),
-            "user_about": (
-                "ℹ️ <b>About This Bot</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                "This is an <b>Advanced Forward Bot</b> designed to mirror and redirect content between chats with customization filters.\n\n"
-                "• Version: <code>v2.1.0</code>\n"
-                "• Engine: <code>pyTelegramBotAPI</code>\n"
-                "• Features: Instant delivery, regex filters, caption editor."
-            ),
-            "user_settings": (
-                "⚙️ <b>Bot Settings</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                "Configure your bot parameters below:\n"
-                "• Delay: <code>Disabled (Instant)</code>\n"
-                "• Anti-Spam: <code>Active</code>\n"
-                "• Forward Signature: <code>Off</code>\n\n"
-                "<i>To change settings, use the /settings chat command.</i>"
-            ),
-            "user_status": (
-                "📊 <b>System Status</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                "• Bot Server: 🟢 <code>ONLINE</code>\n"
-                "• Database Conn: 🟢 <code>CONNECTED</code>\n"
-                "• Processed Jobs: <code>1,245 forwards</code>\n"
-                "• Memory Usage: <code>45 MB</code>"
-            ),
-            "user_how_to_use": (
-                "🔗 <b>How to Use Guide</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                "Check out our interactive tutorial:\n"
-                "1. Add the bot to your target channel as Admin.\n"
-                "2. Send the channel ID or link to the bot.\n"
-                "3. Use the forwarding wizard to link source and destination.\n\n"
-                "Read the complete guide on GitHub: <a href='https://github.com'>Advanced-Forward-Bot-Wiki</a>"
-            )
-        }
-        
-        response_text = response_texts.get(data, f"You clicked on: <b>{button_name}</b>")
-        
-        # Send reply message to user (without erasing the welcome page)
+        if not response_text:
+            # Fallback to default messages
+            response_text = DEFAULT_CONFIG["button_messages"].get(data, "Response not configured.")
+            
         try:
             bot.send_message(chat_id, response_text, parse_mode="HTML")
         except Exception as e:
@@ -417,12 +493,10 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
         
         if data == "admin_menu":
-            # Delete shortcut button message and show panel
             try:
                 bot.delete_message(chat_id, call.message.message_id)
             except:
                 pass
-            # Trigger admin panel
             # Create a mock message to reuse the command function
             mock_msg = telebot.types.Message(
                 message_id=call.message.message_id,
@@ -434,6 +508,20 @@ def handle_callbacks(call):
                 json_string=""
             )
             cmd_admin(mock_msg)
+            
+        elif data == "admin_intro_menu":
+            try:
+                bot.delete_message(chat_id, call.message.message_id)
+            except:
+                pass
+            show_admin_intro_menu(chat_id)
+            
+        elif data == "admin_buttons_menu":
+            try:
+                bot.delete_message(chat_id, call.message.message_id)
+            except:
+                pass
+            show_admin_buttons_menu(chat_id)
             
         elif data == "admin_edit_text":
             user_states[user_id] = "WAITING_FOR_TEXT"
@@ -460,6 +548,20 @@ def handle_callbacks(call):
                 parse_mode="HTML"
             )
             
+        elif data.startswith("admin_edit_btn_"):
+            btn_key = data.replace("admin_edit_btn_", "")
+            user_states[user_id] = f"WAITING_FOR_BTN_{btn_key}"
+            
+            btn_display = btn_key.replace("user_", "").replace("_", " ").title()
+            bot.send_message(
+                chat_id,
+                f"📝 <b>Edit {btn_display} Button Message</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"Please send the new response message for the <b>{btn_display}</b> button.\n\n"
+                f"<i>All HTML formatting tags (like &lt;b&gt;, &lt;i&gt;, &lt;code&gt;, &lt;blockquote&gt;) are supported.</i>",
+                reply_markup=get_cancel_markup(),
+                parse_mode="HTML"
+            )
+            
         elif data == "admin_preview":
             bot.send_message(chat_id, "👁️ <b>WELCOME PREVIEW:</b>\n━━━━━━━━━━━━━━━━━━━━", parse_mode="HTML")
             send_welcome_message(chat_id, call.from_user)
@@ -475,19 +577,14 @@ def handle_callbacks(call):
             send_welcome_message(chat_id, call.from_user)
             
         elif data == "admin_cancel":
+            current_state = user_states.get(user_id)
             user_states[user_id] = None
             bot.send_message(chat_id, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
-            # Re-display panel
-            mock_msg = telebot.types.Message(
-                message_id=call.message.message_id,
-                from_user=call.from_user,
-                date=call.message.date,
-                chat=call.message.chat,
-                content_type="text",
-                options={},
-                json_string=""
-            )
-            cmd_admin(mock_msg)
+            
+            if current_state and current_state.startswith("WAITING_FOR_BTN_"):
+                show_admin_buttons_menu(chat_id)
+            else:
+                show_admin_intro_menu(chat_id)
 
 # --- STARTUP RUN ---
 if __name__ == "__main__":
