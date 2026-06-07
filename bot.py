@@ -774,6 +774,138 @@ def format_welcome_message(text, user):
         id=user.id
     )
 
+def parse_telegram_link(text):
+    """
+    Robust Telegram link parser.
+    Supports message links (e.g. t.me/c/12345/678, t.me/mychat/678)
+    and chat/channel links (e.g. t.me/c/12345, t.me/mychat).
+    Returns (source_id, source_title).
+    """
+    import re
+    cleaned = text.strip()
+    
+    # 1. Check message link first (e.g., t.me/mygroup/1234 or t.me/c/123456/123)
+    match_msg = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/(?:c/)?([^/?#]+)/(\d+)", cleaned)
+    if match_msg:
+        chat_identifier = match_msg.group(1)
+        is_private = "/c/" in cleaned
+        if is_private:
+            try:
+                return int(f"-100{chat_identifier}"), "private"
+            except ValueError:
+                return f"@{chat_identifier}", f"@{chat_identifier}"
+        else:
+            if chat_identifier.isdigit():
+                return int(chat_identifier), f"Chat {chat_identifier}"
+            return f"@{chat_identifier}", f"@{chat_identifier}"
+            
+    # 2. Check chat link (e.g., t.me/mygroup or t.me/c/123456)
+    match_chat = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/(?:c/)?([^/?#]+)", cleaned)
+    if match_chat:
+        chat_identifier = match_chat.group(1)
+        # Exclude bot commands like /start or /cancel
+        if chat_identifier.startswith("/") or chat_identifier.lower() in ["start", "cancel", "admin", "myid", "forward"]:
+            return None, None
+        is_private = "/c/" in cleaned
+        if is_private:
+            try:
+                return int(f"-100{chat_identifier}"), "private"
+            except ValueError:
+                return f"@{chat_identifier}", f"@{chat_identifier}"
+        else:
+            if chat_identifier.isdigit():
+                return int(chat_identifier), f"Chat {chat_identifier}"
+            return f"@{chat_identifier}", f"@{chat_identifier}"
+            
+    return None, None
+
+def check_client_source_access(user_id, source_id):
+    """
+    Checks if the linked userbot or custom bot has access to the source chat.
+    Returns (is_accessible, error_message, resolved_title).
+    """
+    bot_row = db.execute_query("SELECT bot_token, bot_name FROM linked_bots WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="one")
+    ub_row = db.execute_query("SELECT session_string, phone FROM linked_userbots WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="one")
+    
+    if not bot_row and not ub_row:
+        return False, "❌ No linked bots or userbots found. Please add a bot or userbot in Settings first.", None
+
+    is_simulation = True
+    if ub_row and ub_row[0] and not ub_row[0].startswith("SIMULATED"):
+        is_simulation = False
+
+    if is_simulation:
+        resolved_title = "Simulated Source Chat"
+        if isinstance(source_id, int):
+            resolved_title = f"Simulated Group ({source_id})"
+        elif isinstance(source_id, str):
+            resolved_title = source_id
+        return True, None, resolved_title
+
+    # 1. Check via Userbot (Pyrogram) if available
+    if ub_row and ub_row[0]:
+        session = ub_row[0]
+        API_ID = os.environ.get("API_ID") or config.get("api_id")
+        API_HASH = os.environ.get("API_HASH") or config.get("api_hash")
+        
+        if PYROGRAM_AVAILABLE and API_ID and API_HASH:
+            async def do_check():
+                client = Client(
+                    name=f"temp_check_{user_id}",
+                    api_id=int(API_ID),
+                    api_hash=API_HASH,
+                    session_string=session,
+                    in_memory=True
+                )
+                try:
+                    await client.connect()
+                    try:
+                        chat = await client.get_chat(source_id)
+                        title = chat.title or chat.first_name or "Private Source"
+                        return True, None, title
+                    except Exception as e:
+                        err_str = str(e)
+                        if "USER_DEACTIVATED" in err_str:
+                            return False, "❌ The userbot account has been deactivated.", None
+                        elif "SESSION_EXPIRED" in err_str:
+                            return False, "❌ The userbot session has expired. Please re-authenticate.", None
+                        else:
+                            return False, f"❌ Userbot cannot access the source chat: {err_str}", None
+                    finally:
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
+                except Exception as e:
+                    return False, f"❌ Failed to connect userbot client: {e}", None
+                    
+            try:
+                success, err, title = run_async(do_check())
+                return success, err, title
+            except Exception as e:
+                return False, f"❌ Error running access check: {e}", None
+
+    # 2. Check via Custom Bot if userbot not linked
+    if bot_row and bot_row[0]:
+        token = bot_row[0]
+        import requests
+        try:
+            res = requests.get(f"https://api.telegram.org/bot{token}/getChat", params={"chat_id": source_id}, timeout=10)
+            data = res.json()
+            if data.get("ok"):
+                chat = data["result"]
+                title = chat.get("title") or chat.get("username") or "Source Chat"
+                return True, None, title
+            else:
+                desc = data.get("description", "")
+                if "chat not found" in desc.lower():
+                    return False, "❌ Custom bot is not added to the source chat, or the chat ID/link is invalid.", None
+                return False, f"❌ Custom bot access check failed: {desc}", None
+        except Exception as e:
+            return False, f"❌ HTTP error checking custom bot access: {e}", None
+
+    return False, "❌ No active bot or userbot available to verify access.", None
+
 # --- KEYBOARDS ---
 def get_user_welcome_markup(user_id):
     """Returns the welcome inline keyboard shown in the screenshot."""
@@ -2219,17 +2351,10 @@ def handle_admin_inputs(message):
             source_title = message.forward_from_chat.title or message.forward_from_chat.username or "Source Chat"
         elif message.text:
             text = message.text.strip()
-            import re
-            link_match = re.search(r"t\.me/(c/)?([^/]+)/(\d+)", text)
-            if link_match:
-                is_private = link_match.group(1) is not None
-                chat_identifier = link_match.group(2)
-                if is_private:
-                    source_id = int(f"-100{chat_identifier}")
-                    source_title = "private"
-                else:
-                    source_id = f"@{chat_identifier}"
-                    source_title = f"@{chat_identifier}"
+            parsed_id, parsed_title = parse_telegram_link(text)
+            if parsed_id is not None:
+                source_id = parsed_id
+                source_title = parsed_title
             else:
                 if (text.startswith("-") and text[1:].isdigit()) or text.isdigit():
                     source_id = int(text)
@@ -2239,6 +2364,21 @@ def handle_admin_inputs(message):
                     source_title = text
                     
         if source_id is not None:
+            # Dynamically verify if custom bot or userbot can access this chat
+            bot.reply_to(message, "⏳ <b>Verifying access to the source chat...</b>", parse_mode="HTML")
+            has_access, err_msg, resolved_title = check_client_source_access(user_id, source_id)
+            if not has_access:
+                bot.reply_to(
+                    message,
+                    f"⚠️ <b>Access Check Failed</b>\n\n{err_msg}\n\n"
+                    f"Please verify that the bot/userbot has been added to the chat and try again, or type `/cancel`.",
+                    parse_mode="HTML"
+                )
+                return
+                
+            if resolved_title:
+                source_title = resolved_title
+                
             user_states[user_id] = None
             targets = db.execute_query("SELECT chat_id, chat_title FROM target_chats WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="all")
             bots = db.execute_query("SELECT bot_name, bot_username FROM linked_bots WHERE user_id = %s ORDER BY id DESC", (user_id,), fetch="all")
