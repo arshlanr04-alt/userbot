@@ -15,6 +15,27 @@ def is_admin(_, __, message: Message) -> bool:
 
 admin_filter = filters.create(is_admin)
 
+async def edit_admin_message(client: Client, callback_query: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup):
+    """Edits the admin message correctly, whether it is a photo message or a text message."""
+    message = callback_query.message
+    try:
+        if message.photo:
+            await client.edit_message_caption(
+                chat_id=message.chat.id,
+                message_id=message.id,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+        else:
+            await message.edit_text(
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+    except RPCError as e:
+        logger.error(f"Failed to edit admin message: {e}")
+
 async def build_main_dashboard():
     """Generates the main dashboard text and keyboard markup."""
     settings = await db.get_settings()
@@ -56,7 +77,7 @@ async def build_main_dashboard():
             InlineKeyboardButton("👁️ Live Preview", callback_data="admin_preview")
         ],
         [
-            InlineKeyboardButton("❌ Close Menu", callback_data="admin_close")
+            InlineKeyboardButton("🏡 Back to Start Screen", callback_data="admin_close")
         ]
     ]
     
@@ -83,25 +104,20 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
         
     data = callback_query.data
     
-    # Close Menu
+    # Close Menu (Go back to user Start Screen)
     if data == "admin_close":
         await db.clear_admin_state(user_id)
-        await callback_query.message.delete()
-        await callback_query.answer("Admin panel closed.")
+        # Generate the normal start message for this admin user (with is_admin=True so they keep the entry button)
+        text_content, photo, reply_markup = await generate_start_message(callback_query.from_user, is_admin=True)
+        await edit_admin_message(client, callback_query, text_content, reply_markup)
+        await callback_query.answer("Returned to Start Screen")
         return
         
     # Main Dashboard
     if data == "admin_main":
         await db.clear_admin_state(user_id)
         text, reply_markup = await build_main_dashboard()
-        try:
-            await callback_query.message.edit_text(
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
-        except RPCError:
-            pass # Avoid error if content is unchanged
+        await edit_admin_message(client, callback_query, text, reply_markup)
         await callback_query.answer()
         return
         
@@ -111,21 +127,16 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
         new_val = 0 if settings.get("is_quote", 1) else 1
         await db.update_setting_field("is_quote", new_val)
         text, reply_markup = await build_main_dashboard()
-        try:
-            await callback_query.message.edit_text(
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
-        except RPCError:
-            pass
+        await edit_admin_message(client, callback_query, text, reply_markup)
         await callback_query.answer("Quote style updated!")
         return
         
     # Edit Photo State Initiation
     if data == "admin_photo":
         await db.set_admin_state(user_id, "WAITING_FOR_PHOTO")
-        await callback_query.message.edit_text(
+        await edit_admin_message(
+            client,
+            callback_query,
             text=(
                 "📷 <b>EDIT START PHOTO</b>\n\n"
                 "Send me the photo you want to display on <code>/start</code>.\n\n"
@@ -134,7 +145,6 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
                 "• Send `/remove` to remove the photo and send text-only starts.\n\n"
                 "<i>Send /cancel to discard changes and go back.</i>"
             ),
-            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_main")]])
         )
         await callback_query.answer()
@@ -143,7 +153,9 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
     # Edit Header State Initiation
     if data == "admin_header":
         await db.set_admin_state(user_id, "WAITING_FOR_HEADER")
-        await callback_query.message.edit_text(
+        await edit_admin_message(
+            client,
+            callback_query,
             text=(
                 "✍️ <b>EDIT HEADER TEXT</b>\n\n"
                 "Send me the new header text. This text is displayed outside the blockquote quotes.\n\n"
@@ -156,7 +168,6 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
                 "<i>Example: ✨ HI {first_name} WELCOME TO OUR BOT 👋</i>\n\n"
                 "<i>Send /cancel to discard changes and go back.</i>"
             ),
-            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_main")]])
         )
         await callback_query.answer()
@@ -165,7 +176,9 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
     # Edit Body State Initiation
     if data == "admin_body":
         await db.set_admin_state(user_id, "WAITING_FOR_BODY")
-        await callback_query.message.edit_text(
+        await edit_admin_message(
+            client,
+            callback_query,
             text=(
                 "📝 <b>EDIT BODY TEXT</b>\n\n"
                 "Send me the new body text. If quote is enabled, this entire block will be inside a blockquote.\n\n"
@@ -173,7 +186,6 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
                 "• <code>{first_name}</code>, <code>{last_name}</code>, <code>{username}</code>, <code>{id}</code>, <code>{mention}</code>\n\n"
                 "<i>Send /cancel to discard changes and go back.</i>"
             ),
-            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_main")]])
         )
         await callback_query.answer()
@@ -202,9 +214,10 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
         keyboard.append([InlineKeyboardButton("➕ Add New Button", callback_data="admin_add_button")])
         keyboard.append([InlineKeyboardButton("🔙 Back to Control Panel", callback_data="admin_main")])
         
-        await callback_query.message.edit_text(
+        await edit_admin_message(
+            client,
+            callback_query,
             text=text,
-            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         await callback_query.answer()
@@ -213,13 +226,14 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
     # Add Button: Phase 1 (Label Input)
     if data == "admin_add_button":
         await db.set_admin_state(user_id, "WAITING_FOR_BTN_LABEL")
-        await callback_query.message.edit_text(
+        await edit_admin_message(
+            client,
+            callback_query,
             text=(
                 "➕ <b>ADD NEW BUTTON</b> (Step 1/3)\n\n"
                 "Send me the label text for this button (e.g. <code>📚 Help</code> or <code>ℹ️ About</code>).\n\n"
                 "<i>Send /cancel to cancel.</i>"
             ),
-            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin_buttons")]])
         )
         await callback_query.answer()
@@ -232,7 +246,6 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("Button deleted successfully!")
         
         # Refresh the buttons menu
-        # Simulate admin_buttons callback
         buttons = await db.get_buttons()
         text = "🎛️ <b>MANAGE START BUTTONS</b>\n\n"
         if not buttons:
@@ -253,20 +266,18 @@ async def admin_callbacks(client: Client, callback_query: CallbackQuery):
         keyboard.append([InlineKeyboardButton("➕ Add New Button", callback_data="admin_add_button")])
         keyboard.append([InlineKeyboardButton("🔙 Back to Control Panel", callback_data="admin_main")])
         
-        try:
-            await callback_query.message.edit_text(
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        except RPCError:
-            pass
+        await edit_admin_message(
+            client,
+            callback_query,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
         
     # Preview start screen
     if data == "admin_preview":
         await callback_query.answer("Generating preview...")
-        text_content, photo, reply_markup = await generate_start_message(callback_query.message)
+        text_content, photo, reply_markup = await generate_start_message(callback_query.from_user, is_admin=True)
         
         preview_header = "👀 <b>LIVE PREVIEW:</b>\n" + "─" * 20 + "\n\n"
         
@@ -314,6 +325,11 @@ async def admin_state_handlers(client: Client, message: Message):
     if not state:
         # Not in any admin state, ignore (let other handlers parse commands like /start)
         return
+        
+    # Command bypass (e.g., if admin sends /start or /admin, clear state and let the command execute)
+    if message.text and message.text.startswith("/") and message.text.strip() not in ("/cancel", "/remove"):
+        await db.clear_admin_state(user_id)
+        message.continue_propagation()
         
     # Cancel action
     if message.text and message.text.strip() == "/cancel":
