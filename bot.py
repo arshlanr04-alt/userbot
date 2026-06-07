@@ -32,14 +32,24 @@ CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 # format: { user_id: { "client": Client, "phone": str, "phone_code_hash": str, "simulation": bool } }
 temp_userbot_logins = {}
 
-# Helper to run async functions synchronously in a new event loop
+import threading
+
+# Create a global background event loop to run all Pyrogram tasks
+background_loop = asyncio.new_event_loop()
+
+def start_background_loop(loop_to_run):
+    asyncio.set_event_loop(loop_to_run)
+    loop_to_run.run_forever()
+
+# Start loop in a background daemon thread
+loop_thread = threading.Thread(target=start_background_loop, args=(background_loop,), daemon=True)
+loop_thread.start()
+logger.info("Initialized background event loop thread for Pyrogram integrations.")
+
 def run_async(coro):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    """Schedules a coroutine to run on the background loop and blocks until it returns a result."""
+    future = asyncio.run_coroutine_threadsafe(coro, background_loop)
+    return future.result()
 
 # --- DATABASE MANAGER (PostgreSQL with SQLite fallback) ---
 class DBManager:
@@ -106,6 +116,9 @@ class DBManager:
                     "id SERIAL PRIMARY KEY, "
                     "user_id BIGINT, "
                     "bot_token TEXT, "
+                    "bot_name TEXT, "
+                    "bot_username TEXT, "
+                    "bot_telegram_id BIGINT, "
                     "active BOOLEAN DEFAULT TRUE, "
                     "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                     ")", commit=True
@@ -137,6 +150,9 @@ class DBManager:
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                 "user_id INTEGER, "
                 "bot_token TEXT, "
+                "bot_name TEXT, "
+                "bot_username TEXT, "
+                "bot_telegram_id INTEGER, "
                 "active INTEGER DEFAULT 1, "
                 "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ")"
@@ -154,6 +170,21 @@ class DBManager:
             conn.commit()
             cursor.close()
             conn.close()
+            
+        # Run safe migrations to add new columns to linked_bots if they are missing
+        try:
+            self.execute_query("ALTER TABLE linked_bots ADD COLUMN bot_name TEXT", commit=True)
+        except Exception:
+            pass
+        try:
+            self.execute_query("ALTER TABLE linked_bots ADD COLUMN bot_username TEXT", commit=True)
+        except Exception:
+            pass
+        try:
+            self.execute_query("ALTER TABLE linked_bots ADD COLUMN bot_telegram_id BIGINT", commit=True)
+        except Exception:
+            pass
+            
         logger.info("Database initialized successfully.")
 
 # Initialize DB Manager
@@ -506,26 +537,48 @@ def show_welcome_panel(call):
     except Exception as e:
         logger.error(f"Error editing text back to welcome panel: {e}")
 
-def get_bots_settings_markup():
-    """Returns the keyboard layout for the Bots configuration submenu."""
+def get_bots_settings_markup(user_id):
+    """Returns the keyboard layout for the Bots configuration submenu dynamically showing linked bots."""
     markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("➕ Add Bot", callback_data="settings_bots_add"),
-        InlineKeyboardButton("👤 Add Userbot", callback_data="settings_bots_userbot")
+    
+    # Retrieve linked bots
+    linked_bots = db.execute_query(
+        "SELECT id, bot_name, bot_username FROM linked_bots WHERE user_id = %s",
+        (user_id,), fetch="all"
     )
-    markup.add(InlineKeyboardButton("◀️ Back to Settings", callback_data="settings_menu"))
+    # Retrieve linked userbots
+    linked_userbots = db.execute_query(
+        "SELECT id, phone FROM linked_userbots WHERE user_id = %s",
+        (user_id,), fetch="all"
+    )
+    
+    # If bots exist, show them. Otherwise show the add button.
+    if linked_bots:
+        for b_id, b_name, b_username in linked_bots:
+            display_name = b_name if b_name else f"@{b_username}"
+            markup.add(InlineKeyboardButton(display_name, callback_data=f"manage_bot_{b_id}"))
+    else:
+        markup.add(InlineKeyboardButton("➕ Add Bot ➕", callback_data="settings_bots_add"))
+            
+    # If userbots exist, show them. Otherwise show the add button.
+    if linked_userbots:
+        for u_id, phone in linked_userbots:
+            markup.add(InlineKeyboardButton(f"👤 Userbot ({phone})", callback_data=f"manage_userbot_{u_id}"))
+    else:
+        markup.add(InlineKeyboardButton("➕ Add User bot ➕", callback_data="settings_bots_userbot"))
+            
+    # Back button on its own row
+    markup.add(InlineKeyboardButton("back", callback_data="settings_menu"))
     return markup
 
 def show_bots_settings_panel(call):
     """Transition from Settings Panel to Bots Settings Panel by editing in place."""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
+    user_id = call.from_user.id
     
-    text = (
-        "<b>🤖 BOTS CONFIGURATION</b>\n\n"
-        "<b>Choose an option below to add a bot or userbot to forward content from target group to source group:</b>"
-    )
-    markup = get_bots_settings_markup()
+    text = "<u>My Bots</u>\n\nYou can manage your bots in here"
+    markup = get_bots_settings_markup(user_id)
     
     has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
     
@@ -553,14 +606,13 @@ def show_bots_settings_panel(call):
     except Exception as e:
         logger.error(f"Error editing text to bots settings panel: {e}")
 
-def send_bots_settings_panel(chat_id):
+def send_bots_settings_panel(chat_id, user_id=None):
     """Sends the Bots configuration panel as a new message (used after text-based input flows)."""
+    if user_id is None:
+        user_id = chat_id  # in private chats, chat_id equals user_id
     welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
-    text = (
-        "<b>🤖 BOTS CONFIGURATION</b>\n\n"
-        "<b>Choose an option below to add a bot or userbot to forward content from target group to source group:</b>"
-    )
-    markup = get_bots_settings_markup()
+    text = "<u>My Bots</u>\n\nYou can manage your bots in here"
+    markup = get_bots_settings_markup(user_id)
     if welcome_photo:
         try:
             bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
@@ -569,6 +621,115 @@ def send_bots_settings_panel(chat_id):
             logger.error(f"Error sending photo for bots settings: {e}")
             
     bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+def show_bot_details_panel(call, bot_id):
+    """Transition to Bot Details panel where user can view and remove the bot."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    row = db.execute_query(
+        "SELECT id, bot_name, bot_username, bot_telegram_id FROM linked_bots WHERE id = %s",
+        (bot_id,), fetch="one"
+    )
+    if not row:
+        bot.answer_callback_query(call.id, "❌ Bot not found.", show_alert=True)
+        show_bots_settings_panel(call)
+        return
+        
+    b_id, b_name, b_username, b_tel_id = row
+    
+    text = (
+        "🤖 <b>BOT DETAILS</b>\n\n"
+        "<blockquote>"
+        f"📝 <b>NAME:</b> {b_name}\n"
+        f"🆔 <b>BOT ID:</b> {b_tel_id}\n"
+        f"👤 <b>USERNAME:</b> @{b_username}"
+        "</blockquote>"
+    )
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("❌ Remove ❌", callback_data=f"remove_bot_{b_id}"))
+    markup.add(InlineKeyboardButton("back", callback_data="settings_bots"))
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption to bot details: {e}")
+            
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error editing text to bot details: {e}")
+
+def show_userbot_details_panel(call, u_id):
+    """Transition to Userbot Details panel where user can view and remove the userbot."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    row = db.execute_query(
+        "SELECT id, phone, user_id FROM linked_userbots WHERE id = %s",
+        (u_id,), fetch="one"
+    )
+    if not row:
+        bot.answer_callback_query(call.id, "❌ Userbot not found.", show_alert=True)
+        show_bots_settings_panel(call)
+        return
+        
+    u_id_db, phone, tg_id = row
+    
+    text = (
+        "👤 <b>USERBOT DETAILS</b>\n\n"
+        "<blockquote>"
+        f"📞 <b>PHONE:</b> {phone}\n"
+        f"🆔 <b>USER ID:</b> {tg_id}"
+        "</blockquote>"
+    )
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("❌ Remove ❌", callback_data=f"remove_userbot_{u_id_db}"))
+    markup.add(InlineKeyboardButton("back", callback_data="settings_bots"))
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption to userbot details: {e}")
+            
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error editing text to userbot details: {e}")
 
 def show_admin_intro_menu(chat_id):
     welcome_photo = config.get("welcome_photo", "None")
@@ -769,20 +930,47 @@ def handle_admin_inputs(message):
             )
             return
             
-        # Save token to Database
+        # Verify Bot Details with Telegram API dynamically
+        import requests
+        bot.reply_to(message, "⏳ <b>Verifying bot token with Telegram...</b>", parse_mode="HTML")
         try:
+            res = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+            data = res.json()
+            if not data.get("ok"):
+                bot.reply_to(
+                    message,
+                    "❌ <b>Invalid Bot Token</b>\n"
+                    "Telegram API rejected this token. Make sure it is correct and not revoked.",
+                    parse_mode="HTML",
+                    reply_markup=get_cancel_markup()
+                )
+                return
+                
+            bot_details = data["result"]
+            bot_name = bot_details["first_name"]
+            bot_username = bot_details["username"]
+            bot_telegram_id = bot_details["id"]
+            
+            # Save token and details to Database
             db.execute_query(
-                "INSERT INTO linked_bots (user_id, bot_token) VALUES (%s, %s)",
-                (user_id, token), commit=True
+                "INSERT INTO linked_bots (user_id, bot_token, bot_name, bot_username, bot_telegram_id) VALUES (%s, %s, %s, %s, %s)",
+                (user_id, token, bot_name, bot_username, bot_telegram_id), commit=True
             )
             user_states[user_id] = None
-            bot.reply_to(message, "✅ <b>Custom Bot Token added successfully!</b>", parse_mode="HTML")
-            send_bots_settings_panel(message.chat.id)
+            bot.reply_to(
+                message, 
+                f"✅ <b>Custom Bot added successfully!</b>\n\n"
+                f"• Name: {bot_name}\n"
+                f"• Username: @{bot_username}\n"
+                f"• ID: <code>{bot_telegram_id}</code>", 
+                parse_mode="HTML"
+            )
+            send_bots_settings_panel(message.chat.id, user_id)
         except Exception as e:
-            logger.error(f"Error saving linked bot: {e}")
-            bot.reply_to(message, f"❌ Failed to save bot token: <code>{e}</code>", parse_mode="HTML")
+            logger.error(f"Error verifying/saving linked bot: {e}")
+            bot.reply_to(message, f"❌ Failed to verify or save bot token: <code>{e}</code>", parse_mode="HTML")
             user_states[user_id] = None
-            send_bots_settings_panel(message.chat.id)
+            send_bots_settings_panel(message.chat.id, user_id)
             
     elif state == "WAITING_FOR_PHONE":
         phone = message.text.strip() if message.text else ""
@@ -805,19 +993,19 @@ def handle_admin_inputs(message):
         if PYROGRAM_AVAILABLE and API_ID and API_HASH:
             bot.reply_to(message, "⏳ <b>Connecting to Telegram... Please wait.</b>", parse_mode="HTML")
             try:
-                client = Client(
-                    name=f"temp_userbot_{user_id}",
-                    api_id=int(API_ID),
-                    api_hash=API_HASH,
-                    in_memory=True
-                )
-                
+                # Initialize Pyrogram Client inside the background loop's context
                 async def do_send_code():
-                    await client.connect()
-                    sent_code = await client.send_code(phone)
-                    return sent_code.phone_code_hash
+                    c = Client(
+                        name=f"temp_userbot_{user_id}",
+                        api_id=int(API_ID),
+                        api_hash=API_HASH,
+                        in_memory=True
+                    )
+                    await c.connect()
+                    sent_code = await c.send_code(phone)
+                    return c, sent_code.phone_code_hash
                     
-                phone_code_hash = run_async(do_send_code())
+                client, phone_code_hash = run_async(do_send_code())
                 
                 temp_userbot_logins[user_id] = {
                     "client": client,
@@ -1108,6 +1296,37 @@ def handle_callbacks(call):
                 f"⚙️ {option_name} settings will be configured here.",
                 show_alert=True
             )
+            
+    # ─── BOTS MANAGEMENT CALLBACKS ───
+    elif data.startswith("manage_bot_"):
+        bot.answer_callback_query(call.id)
+        bot_id = int(data.replace("manage_bot_", ""))
+        show_bot_details_panel(call, bot_id)
+        
+    elif data.startswith("manage_userbot_"):
+        bot.answer_callback_query(call.id)
+        u_id = int(data.replace("manage_userbot_", ""))
+        show_userbot_details_panel(call, u_id)
+        
+    elif data.startswith("remove_bot_"):
+        bot_id = int(data.replace("remove_bot_", ""))
+        try:
+            db.execute_query("DELETE FROM linked_bots WHERE id = %s", (bot_id,), commit=True)
+            bot.answer_callback_query(call.id, "✅ Bot removed successfully!", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error removing bot from DB: {e}")
+            bot.answer_callback_query(call.id, "❌ Error removing bot.", show_alert=True)
+        show_bots_settings_panel(call)
+        
+    elif data.startswith("remove_userbot_"):
+        u_id = int(data.replace("remove_userbot_", ""))
+        try:
+            db.execute_query("DELETE FROM linked_userbots WHERE id = %s", (u_id,), commit=True)
+            bot.answer_callback_query(call.id, "✅ Userbot removed successfully!", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error removing userbot from DB: {e}")
+            bot.answer_callback_query(call.id, "❌ Error removing userbot.", show_alert=True)
+        show_bots_settings_panel(call)
             
     # ─── ADMIN BUTTON CALLBACKS ───
     elif data.startswith("admin_"):
