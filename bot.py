@@ -479,6 +479,13 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
         try:
             await client.connect()
             
+            # Populate peer database cache for numeric IDs
+            try:
+                async for dialog in client.get_dialogs(limit=100):
+                    pass
+            except Exception as e:
+                logger.warning(f"Failed to fetch dialogs in forwarding task: {e}")
+            
             # Resolve source chat entity (can be ID or username)
             try:
                 resolved_chat = await client.get_chat(source_id)
@@ -878,6 +885,14 @@ def check_client_source_access(user_id, source_id):
                 )
                 try:
                     await client.connect()
+                    
+                    # Populate peer database cache for numeric IDs
+                    try:
+                        async for dialog in client.get_dialogs(limit=100):
+                            pass
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch dialogs in access check: {e}")
+                    
                     try:
                         chat = await client.get_chat(source_id)
                         title = chat.title or chat.first_name or "Private Source"
