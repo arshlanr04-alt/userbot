@@ -378,7 +378,9 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
     
     # Determine if we run in simulation mode
     is_simulation = True
-    if ub_row and ub_row[0] and not ub_row[0].startswith("SIMULATED"):
+    has_real_userbot = ub_row and ub_row[0] and not ub_row[0].startswith("SIMULATED")
+    has_real_bot = bot_row and bot_row[0] and bot_row[0] != "YOUR_BOT_TOKEN_HERE" and not bot_row[0].startswith("SIMULATED")
+    if has_real_userbot or has_real_bot:
         is_simulation = False
         
     def update_status_message(is_done=False):
@@ -447,17 +449,32 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
         active_forwarding_tasks.pop(user_id, None)
     else:
         # Real Mode using Pyrogram
-        session = ub_row[0]
+        session = ub_row[0] if (ub_row and ub_row[0]) else None
+        bot_token = bot_row[0] if (bot_row and bot_row[0]) else None
+        
         API_ID = os.environ.get("API_ID") or config.get("api_id")
         API_HASH = os.environ.get("API_HASH") or config.get("api_hash")
         
-        client = Client(
-            name=f"forwarder_{user_id}",
-            api_id=int(API_ID),
-            api_hash=API_HASH,
-            session_string=session,
-            in_memory=True
-        )
+        if session and not session.startswith("SIMULATED"):
+            client = Client(
+                name=f"forwarder_{user_id}",
+                api_id=int(API_ID),
+                api_hash=API_HASH,
+                session_string=session,
+                in_memory=True
+            )
+        elif bot_token and not bot_token.startswith("SIMULATED"):
+            client = Client(
+                name=f"forwarder_{user_id}",
+                api_id=int(API_ID),
+                api_hash=API_HASH,
+                bot_token=bot_token,
+                in_memory=True
+            )
+        else:
+            stats["status"] = "No credentials"
+            update_status_message(is_done=True)
+            return
         
         try:
             await client.connect()
@@ -831,7 +848,9 @@ def check_client_source_access(user_id, source_id):
         return False, "❌ No linked bots or userbots found. Please add a bot or userbot in Settings first.", None
 
     is_simulation = True
-    if ub_row and ub_row[0] and not ub_row[0].startswith("SIMULATED"):
+    has_real_userbot = ub_row and ub_row[0] and not ub_row[0].startswith("SIMULATED")
+    has_real_bot = bot_row and bot_row[0] and bot_row[0] != "YOUR_BOT_TOKEN_HERE" and not bot_row[0].startswith("SIMULATED")
+    if has_real_userbot or has_real_bot:
         is_simulation = False
 
     if is_simulation:
