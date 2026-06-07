@@ -259,6 +259,107 @@ def get_cancel_markup():
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel"))
     return markup
 
+def get_settings_markup():
+    """Returns the settings panel keyboard layout as requested by the user."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("🤖 Bots", callback_data="settings_bots"),
+        InlineKeyboardButton("🏷️ Channels", callback_data="settings_channels")
+    )
+    markup.row(
+        InlineKeyboardButton("🖊️ Caption", callback_data="settings_caption"),
+        InlineKeyboardButton("🔲 Button", callback_data="settings_button")
+    )
+    markup.row(
+        InlineKeyboardButton("🕵️ Filters 🕵️", callback_data="settings_filters")
+    )
+    markup.row(
+        InlineKeyboardButton("🚫 Remove Words", callback_data="settings_remove_words")
+    )
+    markup.row(
+        InlineKeyboardButton("Extra Settings 🧪", callback_data="settings_extra")
+    )
+    markup.row(
+        InlineKeyboardButton("◀️ Back", callback_data="settings_back")
+    )
+    return markup
+
+def show_settings_panel(call):
+    """Transition from welcome panel to Settings Panel by editing the caption and buttons in place."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    settings_text = (
+        "<b>HERE IS THE SETTINGS PANEL⚙️</b>\n\n"
+        "<b>CHANGE YOUR SETTINGS AS YOUR WISH👇</b>"
+    )
+    markup = get_settings_markup()
+    
+    # Determine if message has photo
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=settings_text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption to settings panel: {e}")
+            
+    # Text fallback
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=settings_text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error editing text to settings panel: {e}")
+
+def show_welcome_panel(call):
+    """Transition from Settings Panel back to the Main Welcome panel by editing in place."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user = call.from_user
+    
+    welcome_text = config.get("welcome_text", DEFAULT_CONFIG["welcome_text"])
+    formatted_text = format_welcome_message(welcome_text, user)
+    markup = get_user_welcome_markup(user.id)
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=formatted_text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption back to welcome panel: {e}")
+            
+    # Text fallback
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=formatted_text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error editing text back to welcome panel: {e}")
+
 def show_admin_intro_menu(chat_id):
     welcome_photo = config.get("welcome_photo", "None")
     welcome_text = config.get("welcome_text", "")
@@ -472,6 +573,10 @@ def handle_callbacks(call):
     if data.startswith("user_"):
         bot.answer_callback_query(call.id)
         
+        if data == "user_settings":
+            show_settings_panel(call)
+            return
+            
         button_messages = config.get("button_messages", DEFAULT_CONFIG["button_messages"])
         response_text = button_messages.get(data)
         
@@ -483,6 +588,19 @@ def handle_callbacks(call):
             bot.send_message(chat_id, response_text, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Error sending callback reply: {e}")
+            
+    # ─── SETTINGS PANEL CALLBACKS ───
+    elif data.startswith("settings_"):
+        if data == "settings_back":
+            bot.answer_callback_query(call.id)
+            show_welcome_panel(call)
+        else:
+            option_name = data.replace("settings_", "").replace("_", " ").title()
+            bot.answer_callback_query(
+                call.id,
+                f"⚙️ {option_name} settings will be configured here.",
+                show_alert=True
+            )
             
     # ─── ADMIN BUTTON CALLBACKS ───
     elif data.startswith("admin_"):
