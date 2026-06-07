@@ -72,12 +72,42 @@ def save_config(config):
 # Initialize Config
 config = load_config()
 
-# Validate Token
-TOKEN = config.get("bot_token")
-if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE":
-    logger.warning("⚠️ Bot Token is not set in config.json! Please edit config.json and insert your token.")
-    # We will initialize with empty string to avoid crash on import, but log warnings.
-    TOKEN = "INVALID_TOKEN_PLACEHOLDER"
+# Validate and Resolve Token
+# Check common environment variables first, then fallback to config.json
+TOKEN = (
+    os.environ.get("BOT_TOKEN") or 
+    os.environ.get("TELEGRAM_BOT_TOKEN") or 
+    os.environ.get("TELEGRAM_TOKEN") or 
+    os.environ.get("TOKEN") or 
+    config.get("bot_token")
+)
+
+# Clean/strip token
+if TOKEN:
+    TOKEN = TOKEN.strip()
+
+# Resolve Admin IDs from env
+env_admins = os.environ.get("ADMIN_IDS")
+if env_admins:
+    try:
+        # Expecting comma-separated numbers, e.g. "123456,789012"
+        parsed_admins = [int(x.strip()) for x in env_admins.split(",") if x.strip().isdigit()]
+        if parsed_admins:
+            config["admin_ids"] = list(set(config.get("admin_ids", []) + parsed_admins))
+            logger.info(f"Loaded admin IDs from environment: {parsed_admins}")
+    except Exception as e:
+        logger.error(f"Error parsing ADMIN_IDS environment variable: {e}")
+
+# Validate Token format before initializing telebot
+if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE" or ":" not in TOKEN:
+    logger.critical("❌ ERROR: Bot Token is missing or invalid!")
+    print("\n" + "="*80)
+    print("CRITICAL CONFIGURATION ERROR:")
+    print("Your Telegram Bot Token is not set or is invalid.")
+    print("We checked environment variables (BOT_TOKEN, TELEGRAM_BOT_TOKEN, TOKEN) and config.json.")
+    print("Please set the 'BOT_TOKEN' environment variable in your Railway variables.")
+    print("="*80 + "\n")
+    raise ValueError("Missing or invalid Bot Token. Please configure the BOT_TOKEN environment variable.")
 
 # Initialize Bot
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
