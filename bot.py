@@ -1,8 +1,19 @@
 import os
 import json
 import logging
+import asyncio
+import sqlite3
+import psycopg2
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# Dynamic Pyrogram Import to prevent crash if not installed
+try:
+    import pyrogram
+    from pyrogram import Client
+    PYROGRAM_AVAILABLE = True
+except ImportError:
+    PYROGRAM_AVAILABLE = False
 
 # Setup logging with a premium-looking format
 logging.basicConfig(
@@ -16,8 +27,139 @@ logger = logging.getLogger(__name__)
 
 # Constants and Configuration Paths
 CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
+# Temporary store for ongoing userbot login attempts
+# format: { user_id: { "client": Client, "phone": str, "phone_code_hash": str, "simulation": bool } }
+temp_userbot_logins = {}
+
+# Helper to run async functions synchronously in a new event loop
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+# --- DATABASE MANAGER (PostgreSQL with SQLite fallback) ---
+class DBManager:
+    def __init__(self):
+        self.db_url = os.environ.get("DATABASE_URL")
+        self.is_postgres = False
+        self.init_db()
+
+    def get_connection(self):
+        if self.db_url:
+            try:
+                # Standardize postgres:// to postgresql:// for psycopg2 compatibility
+                url = self.db_url
+                if url.startswith("postgres://"):
+                    url = url.replace("postgres://", "postgresql://", 1)
+                conn = psycopg2.connect(url)
+                self.is_postgres = True
+                return conn
+            except Exception as e:
+                logger.error(f"Failed to connect to PostgreSQL via DATABASE_URL: {e}. Falling back to SQLite.")
+        
+        # SQLite Fallback
+        self.is_postgres = False
+        sqlite_file = os.path.join(CONFIG_DIR, "bot.db")
+        return sqlite3.connect(sqlite_file)
+
+    def execute_query(self, query, params=(), commit=False, fetch=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            # PostgreSQL uses %s placeholders, SQLite uses ?
+            if not self.is_postgres:
+                query = query.replace("%s", "?")
+            cursor.execute(query, params)
+            if commit:
+                conn.commit()
+            if fetch == "one":
+                return cursor.fetchone()
+            elif fetch == "all":
+                return cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Database query error: {e}. Query: {query}")
+            if commit:
+                try:
+                    conn.rollback()
+                except:
+                    pass
+        finally:
+            cursor.close()
+            conn.close()
+
+    def init_db(self):
+        if self.db_url:
+            # PostgreSQL schema
+            try:
+                self.execute_query(
+                    "CREATE TABLE IF NOT EXISTS settings ("
+                    "key VARCHAR(50) PRIMARY KEY, "
+                    "value TEXT"
+                    ")", commit=True
+                )
+                self.execute_query(
+                    "CREATE TABLE IF NOT EXISTS linked_bots ("
+                    "id SERIAL PRIMARY KEY, "
+                    "user_id BIGINT, "
+                    "bot_token TEXT, "
+                    "active BOOLEAN DEFAULT TRUE, "
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")", commit=True
+                )
+                self.execute_query(
+                    "CREATE TABLE IF NOT EXISTS linked_userbots ("
+                    "id SERIAL PRIMARY KEY, "
+                    "user_id BIGINT, "
+                    "phone TEXT, "
+                    "session_string TEXT, "
+                    "active BOOLEAN DEFAULT TRUE, "
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")", commit=True
+                )
+            except Exception as e:
+                logger.critical(f"Failed to initialize PostgreSQL schema: {e}")
+        else:
+            # SQLite schema
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS settings ("
+                "key TEXT PRIMARY KEY, "
+                "value TEXT"
+                ")"
+            )
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS linked_bots ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "user_id INTEGER, "
+                "bot_token TEXT, "
+                "active INTEGER DEFAULT 1, "
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS linked_userbots ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "user_id INTEGER, "
+                "phone TEXT, "
+                "session_string TEXT, "
+                "active INTEGER DEFAULT 1, "
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+        logger.info("Database initialized successfully.")
+
+# Initialize DB Manager
+db = DBManager()
+
+# Default Configurations
 DEFAULT_BUTTON_MESSAGES = {
     "user_help": (
         "📚 <b>Help Menu</b>\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -71,61 +213,65 @@ DEFAULT_CONFIG = {
     "button_messages": DEFAULT_BUTTON_MESSAGES
 }
 
-# --- CONFIG MANAGEMENT ---
+# --- CONFIG MANAGEMENT (Database Backed) ---
 def load_config():
-    """Loads configuration from JSON file, creating it if it doesn't exist."""
-    if not os.path.exists(CONFIG_FILE):
+    """Loads configuration from settings table, creating it with defaults if not exists."""
+    row = db.execute_query("SELECT value FROM settings WHERE key = %s", ("config",), fetch="one")
+    if not row:
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_CONFIG, f, indent=4, ensure_ascii=False)
-            logger.info(f"Created default configuration file at {CONFIG_FILE}")
+            val = json.dumps(DEFAULT_CONFIG, ensure_ascii=False)
+            db.execute_query("INSERT INTO settings (key, value) VALUES (%s, %s)", ("config", val), commit=True)
+            logger.info("Created default configuration in database settings.")
             return DEFAULT_CONFIG
         except Exception as e:
-            logger.error(f"Error creating config file: {e}")
+            logger.error(f"Error creating default config in DB: {e}")
             return DEFAULT_CONFIG
     
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            config = json.load(f)
-            # Ensure all keys exist
-            updated = False
-            for k, v in DEFAULT_CONFIG.items():
-                if k not in config:
-                    config[k] = v
-                    updated = True
+        config = json.loads(row[0])
+        # Ensure all keys exist
+        updated = False
+        for k, v in DEFAULT_CONFIG.items():
+            if k not in config:
+                config[k] = v
+                updated = True
             
-            # Ensure button messages exist
-            if "button_messages" not in config:
-                config["button_messages"] = DEFAULT_CONFIG["button_messages"]
-                updated = True
-            else:
-                for kb, vb in DEFAULT_CONFIG["button_messages"].items():
-                    if kb not in config["button_messages"]:
-                        config["button_messages"][kb] = vb
-                        updated = True
+        # Ensure button messages exist
+        if "button_messages" not in config:
+            config["button_messages"] = DEFAULT_CONFIG["button_messages"]
+            updated = True
+        else:
+            for kb, vb in DEFAULT_CONFIG["button_messages"].items():
+                if kb not in config["button_messages"]:
+                    config["button_messages"][kb] = vb
+                    updated = True
                         
-            # Fix welcome message default text if it has no blockquote and is still using the old default
-            old_default_match = "✨ HI {name} WELCOME TO OUR BOT 👋\n\n🎯 <b>I'M AN ADVANCED FORWARD BOT"
-            if config.get("welcome_text", "").startswith(old_default_match):
-                config["welcome_text"] = DEFAULT_CONFIG["welcome_text"]
-                updated = True
+        # Fix welcome message default text if it has no blockquote and is still using the old default
+        old_default_match = "✨ HI {name} WELCOME TO OUR BOT 👋\n\n🎯 <b>I'M AN ADVANCED FORWARD BOT"
+        if config.get("welcome_text", "").startswith(old_default_match):
+            config["welcome_text"] = DEFAULT_CONFIG["welcome_text"]
+            updated = True
                 
-            if updated:
-                save_config(config)
-            return config
+        if updated:
+            save_config(config)
+        return config
     except Exception as e:
-        logger.error(f"Error reading config file: {e}. Using defaults.")
+        logger.error(f"Error reading config from DB: {e}. Using defaults.")
         return DEFAULT_CONFIG
 
 def save_config(config):
-    """Saves configuration back to JSON file."""
+    """Saves configuration back to settings table."""
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
-        logger.info("Configuration saved successfully.")
+        val = json.dumps(config, ensure_ascii=False)
+        row = db.execute_query("SELECT value FROM settings WHERE key = %s", ("config",), fetch="one")
+        if row:
+            db.execute_query("UPDATE settings SET value = %s WHERE key = %s", (val, "config"), commit=True)
+        else:
+            db.execute_query("INSERT INTO settings (key, value) VALUES (%s, %s)", ("config", val), commit=True)
+        logger.info("Configuration saved successfully to Database settings.")
         return True
     except Exception as e:
-        logger.error(f"Error saving config file: {e}")
+        logger.error(f"Error saving config to DB: {e}")
         return False
 
 # Initialize Config
@@ -360,6 +506,70 @@ def show_welcome_panel(call):
     except Exception as e:
         logger.error(f"Error editing text back to welcome panel: {e}")
 
+def get_bots_settings_markup():
+    """Returns the keyboard layout for the Bots configuration submenu."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("➕ Add Bot", callback_data="settings_bots_add"),
+        InlineKeyboardButton("👤 Add Userbot", callback_data="settings_bots_userbot")
+    )
+    markup.add(InlineKeyboardButton("◀️ Back to Settings", callback_data="settings_menu"))
+    return markup
+
+def show_bots_settings_panel(call):
+    """Transition from Settings Panel to Bots Settings Panel by editing in place."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    text = (
+        "<b>🤖 BOTS CONFIGURATION</b>\n\n"
+        "<b>Choose an option below to add a bot or userbot to forward content from target group to source group:</b>"
+    )
+    markup = get_bots_settings_markup()
+    
+    has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+    
+    if has_photo:
+        try:
+            bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Error editing caption to bots settings panel: {e}")
+            
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error editing text to bots settings panel: {e}")
+
+def send_bots_settings_panel(chat_id):
+    """Sends the Bots configuration panel as a new message (used after text-based input flows)."""
+    welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
+    text = (
+        "<b>🤖 BOTS CONFIGURATION</b>\n\n"
+        "<b>Choose an option below to add a bot or userbot to forward content from target group to source group:</b>"
+    )
+    markup = get_bots_settings_markup()
+    if welcome_photo:
+        try:
+            bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.error(f"Error sending photo for bots settings: {e}")
+            
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
 def show_admin_intro_menu(chat_id):
     welcome_photo = config.get("welcome_photo", "None")
     welcome_text = config.get("welcome_text", "")
@@ -494,7 +704,8 @@ def handle_admin_inputs(message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
     
-    if not is_admin(user_id):
+    # Allow users to complete the custom bot/userbot wizards, but restrict introductory configs to admins
+    if not is_admin(user_id) and state not in ["WAITING_FOR_BOT_TOKEN", "WAITING_FOR_PHONE", "WAITING_FOR_CODE", "WAITING_FOR_2FA"]:
         user_states[user_id] = None
         return
         
@@ -546,6 +757,275 @@ def handle_admin_inputs(message):
         else:
             bot.reply_to(message, "❌ Please upload a photo or send a photo URL.", reply_markup=get_cancel_markup())
             
+    elif state == "WAITING_FOR_BOT_TOKEN":
+        token = message.text.strip() if message.text else ""
+        if not token or ":" not in token:
+            bot.reply_to(
+                message, 
+                "❌ <b>Invalid Bot Token</b>\n"
+                "Please send a valid Bot Token (e.g. <code>123456789:ABCdef...</code>) containing a colon.", 
+                parse_mode="HTML", 
+                reply_markup=get_cancel_markup()
+            )
+            return
+            
+        # Save token to Database
+        try:
+            db.execute_query(
+                "INSERT INTO linked_bots (user_id, bot_token) VALUES (%s, %s)",
+                (user_id, token), commit=True
+            )
+            user_states[user_id] = None
+            bot.reply_to(message, "✅ <b>Custom Bot Token added successfully!</b>", parse_mode="HTML")
+            send_bots_settings_panel(message.chat.id)
+        except Exception as e:
+            logger.error(f"Error saving linked bot: {e}")
+            bot.reply_to(message, f"❌ Failed to save bot token: <code>{e}</code>", parse_mode="HTML")
+            user_states[user_id] = None
+            send_bots_settings_panel(message.chat.id)
+            
+    elif state == "WAITING_FOR_PHONE":
+        phone = message.text.strip() if message.text else ""
+        if not phone or not phone.startswith("+") or not phone[1:].replace(" ", "").isdigit():
+            bot.reply_to(
+                message,
+                "❌ <b>Invalid Phone Number</b>\n"
+                "Please enter a valid phone number with country code starting with <code>+</code> (e.g., <code>+1234567890</code>).",
+                parse_mode="HTML",
+                reply_markup=get_cancel_markup()
+            )
+            return
+            
+        phone = phone.replace(" ", "")
+        
+        # Check credentials and library availability for real Pyrogram connection
+        API_ID = os.environ.get("API_ID") or config.get("api_id")
+        API_HASH = os.environ.get("API_HASH") or config.get("api_hash")
+        
+        if PYROGRAM_AVAILABLE and API_ID and API_HASH:
+            bot.reply_to(message, "⏳ <b>Connecting to Telegram... Please wait.</b>", parse_mode="HTML")
+            try:
+                client = Client(
+                    name=f"temp_userbot_{user_id}",
+                    api_id=int(API_ID),
+                    api_hash=API_HASH,
+                    in_memory=True
+                )
+                
+                async def do_send_code():
+                    await client.connect()
+                    sent_code = await client.send_code(phone)
+                    return sent_code.phone_code_hash
+                    
+                phone_code_hash = run_async(do_send_code())
+                
+                temp_userbot_logins[user_id] = {
+                    "client": client,
+                    "phone": phone,
+                    "phone_code_hash": phone_code_hash,
+                    "simulation": False
+                }
+                user_states[user_id] = "WAITING_FOR_CODE"
+                
+                bot.send_message(
+                    message.chat.id,
+                    "📩 <b>Code Sent!</b>\n"
+                    "I've sent a login code to your official Telegram app. Please paste it here:",
+                    parse_mode="HTML",
+                    reply_markup=get_cancel_markup()
+                )
+            except Exception as e:
+                logger.error(f"Pyrogram code send error: {e}")
+                bot.reply_to(
+                    message,
+                    f"❌ <b>Telegram Connection Error</b>\n"
+                    f"Failed to request login code: <code>{e}</code>\n\n"
+                    f"Please check your Telegram API ID/Hash configurations.",
+                    parse_mode="HTML"
+                )
+                user_states[user_id] = None
+                send_bots_settings_panel(message.chat.id)
+        else:
+            # Simulation Mode (if credentials/libraries are missing)
+            warning_msg = ""
+            if not PYROGRAM_AVAILABLE:
+                warning_msg += "• <code>pyrogram</code> library is not installed.\n"
+            if not (API_ID and API_HASH):
+                warning_msg += "• <code>API_ID</code> / <code>API_HASH</code> environment variables are not set.\n"
+                
+            temp_userbot_logins[user_id] = {
+                "phone": phone,
+                "simulation": True
+            }
+            user_states[user_id] = "WAITING_FOR_CODE"
+            
+            bot.reply_to(
+                message,
+                f"⚠️ <b>Simulation Mode Activated</b>\n"
+                f"The bot is running in layout testing mode because:\n{warning_msg}\n"
+                f"💬 I've sent a login code to your official Telegram app. Please paste it here (enter any 5 digit code):",
+                parse_mode="HTML",
+                reply_markup=get_cancel_markup()
+            )
+            
+    elif state == "WAITING_FOR_CODE":
+        code = message.text.strip() if message.text else ""
+        login_info = temp_userbot_logins.get(user_id)
+        
+        if not login_info:
+            bot.reply_to(message, "❌ Session expired. Please click Add Userbot to start over.")
+            user_states[user_id] = None
+            return
+            
+        if login_info.get("simulation"):
+            # Simulation mode success
+            phone = login_info["phone"]
+            sim_session = f"SIMULATED_SESSION_STRING_FOR_{phone}_{code}"
+            
+            try:
+                db.execute_query(
+                    "INSERT INTO linked_userbots (user_id, phone, session_string) VALUES (%s, %s, %s)",
+                    (user_id, phone, sim_session), commit=True
+                )
+                temp_userbot_logins.pop(user_id, None)
+                user_states[user_id] = None
+                
+                bot.reply_to(
+                    message,
+                    "✅ <b>Success! Your account is linked. We are now hosting your Userbot (Simulation Mode).</b>",
+                    parse_mode="HTML"
+                )
+                send_bots_settings_panel(message.chat.id)
+            except Exception as e:
+                logger.error(f"Error saving simulated userbot: {e}")
+                user_states[user_id] = None
+                send_bots_settings_panel(message.chat.id)
+        else:
+            # Real pyrogram login
+            bot.reply_to(message, "⏳ <b>Verifying code and signing in...</b>", parse_mode="HTML")
+            client = login_info["client"]
+            phone = login_info["phone"]
+            phone_code_hash = login_info["phone_code_hash"]
+            
+            async def do_sign_in():
+                try:
+                    await client.sign_in(phone, phone_code_hash, code)
+                    return "OK"
+                except pyrogram.errors.SessionPasswordNeeded:
+                    return "NEED_2FA"
+                    
+            try:
+                res = run_async(do_sign_in())
+                if res == "NEED_2FA":
+                    user_states[user_id] = "WAITING_FOR_2FA"
+                    bot.send_message(
+                        message.chat.id,
+                        "🔐 <b>2-Step Verification Active</b>\n"
+                        "Your Telegram account requires a cloud password. Please enter your 2FA password below:",
+                        parse_mode="HTML",
+                        reply_markup=get_cancel_markup()
+                    )
+                else:
+                    # Successfully authenticated
+                    async def get_session():
+                        return await client.export_session_string()
+                    session_string = run_async(get_session())
+                    
+                    # Save to DB
+                    db.execute_query(
+                        "INSERT INTO linked_userbots (user_id, phone, session_string) VALUES (%s, %s, %s)",
+                        (user_id, phone, session_string), commit=True
+                    )
+                    
+                    # Disconnect temp client
+                    try:
+                        run_async(client.disconnect())
+                    except:
+                        pass
+                        
+                    temp_userbot_logins.pop(user_id, None)
+                    user_states[user_id] = None
+                    
+                    bot.reply_to(
+                        message,
+                        "✅ <b>Success! Your account is linked. We are now hosting your Userbot.</b>",
+                        parse_mode="HTML"
+                    )
+                    send_bots_settings_panel(message.chat.id)
+            except Exception as e:
+                logger.error(f"Pyrogram sign-in error: {e}")
+                bot.reply_to(
+                    message,
+                    f"❌ <b>Sign-in Failed</b>\n"
+                    f"Error: <code>{e}</code>\n\n"
+                    f"Please click Add Userbot to start over.",
+                    parse_mode="HTML"
+                )
+                try:
+                    run_async(client.disconnect())
+                except:
+                    pass
+                temp_userbot_logins.pop(user_id, None)
+                user_states[user_id] = None
+                send_bots_settings_panel(message.chat.id)
+                
+    elif state == "WAITING_FOR_2FA":
+        password = message.text.strip() if message.text else ""
+        login_info = temp_userbot_logins.get(user_id)
+        
+        if not login_info or login_info.get("simulation"):
+            user_states[user_id] = None
+            return
+            
+        client = login_info["client"]
+        phone = login_info["phone"]
+        
+        bot.reply_to(message, "⏳ <b>Verifying cloud password...</b>", parse_mode="HTML")
+        
+        async def check_password_and_export():
+            await client.check_password(password)
+            return await client.export_session_string()
+            
+        try:
+            session_string = run_async(check_password_and_export())
+            # Save to DB
+            db.execute_query(
+                "INSERT INTO linked_userbots (user_id, phone, session_string) VALUES (%s, %s, %s)",
+                (user_id, phone, session_string), commit=True
+            )
+            
+            # Disconnect temp client
+            try:
+                run_async(client.disconnect())
+            except:
+                pass
+                
+            temp_userbot_logins.pop(user_id, None)
+            user_states[user_id] = None
+            
+            bot.reply_to(
+                message,
+                "✅ <b>Success! Your account is linked. We are now hosting your Userbot.</b>",
+                parse_mode="HTML"
+            )
+            send_bots_settings_panel(message.chat.id)
+        except Exception as e:
+            logger.error(f"Pyrogram check password error: {e}")
+            bot.reply_to(
+                message,
+                f"❌ <b>Verification Failed</b>\n"
+                f"Invalid cloud password: <code>{e}</code>\n\n"
+                f"Please click Add Userbot to try again.",
+                parse_mode="HTML"
+            )
+            try:
+                run_async(client.disconnect())
+            except:
+                pass
+            temp_userbot_logins.pop(user_id, None)
+            user_states[user_id] = None
+            send_bots_settings_panel(message.chat.id)
+            
     elif state.startswith("WAITING_FOR_BTN_"):
         btn_key = state.replace("WAITING_FOR_BTN_", "")
         if not message.text:
@@ -594,6 +1074,33 @@ def handle_callbacks(call):
         if data == "settings_back":
             bot.answer_callback_query(call.id)
             show_welcome_panel(call)
+        elif data == "settings_bots":
+            bot.answer_callback_query(call.id)
+            show_bots_settings_panel(call)
+        elif data == "settings_bots_add":
+            bot.answer_callback_query(call.id)
+            user_states[user_id] = "WAITING_FOR_BOT_TOKEN"
+            bot.send_message(
+                chat_id,
+                "🤖 <b>Adding Custom Bot</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                "Please send the Bot Token (from @BotFather) of the bot you want to add.\n\n"
+                "<i>This bot will be used to forward content from target groups to source groups.</i>",
+                reply_markup=get_cancel_markup(),
+                parse_mode="HTML"
+            )
+        elif data == "settings_bots_userbot":
+            bot.answer_callback_query(call.id)
+            user_states[user_id] = "WAITING_FOR_PHONE"
+            bot.send_message(
+                chat_id,
+                "👤 <b>Adding Custom Userbot</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                "Please enter your Phone Number (with country code, e.g., <code>+1234567890</code>):",
+                reply_markup=get_cancel_markup(),
+                parse_mode="HTML"
+            )
+        elif data == "settings_menu":
+            bot.answer_callback_query(call.id)
+            show_settings_panel(call)
         else:
             option_name = data.replace("settings_", "").replace("_", " ").title()
             bot.answer_callback_query(
@@ -697,10 +1204,25 @@ def handle_callbacks(call):
         elif data == "admin_cancel":
             current_state = user_states.get(user_id)
             user_states[user_id] = None
+            
+            # Clean up Pyrogram active login if exists
+            if user_id in temp_userbot_logins:
+                info = temp_userbot_logins.pop(user_id, None)
+                if info and "client" in info:
+                    try:
+                        run_async(info["client"].disconnect())
+                    except:
+                        pass
+                        
             bot.send_message(chat_id, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
             
-            if current_state and current_state.startswith("WAITING_FOR_BTN_"):
-                show_admin_buttons_menu(chat_id)
+            if current_state:
+                if current_state.startswith("WAITING_FOR_BTN_"):
+                    show_admin_buttons_menu(chat_id)
+                elif current_state in ["WAITING_FOR_BOT_TOKEN", "WAITING_FOR_PHONE", "WAITING_FOR_CODE", "WAITING_FOR_2FA"]:
+                    send_bots_settings_panel(chat_id)
+                else:
+                    show_admin_intro_menu(chat_id)
             else:
                 show_admin_intro_menu(chat_id)
 
