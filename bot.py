@@ -494,15 +494,46 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
                 logger.error(f"Failed to resolve source chat entity: {e}")
                 resolved_chat_id = source_id
                 
-            total = await client.get_chat_history_count(resolved_chat_id)
+            # Fetch all messages from newest to oldest
+            stats["status"] = "Fetching messages..."
+            update_status_message()
+            
+            messages_list = []
+            try:
+                async for msg in client.get_chat_history(resolved_chat_id):
+                    if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
+                        break
+                    messages_list.append(msg)
+                    if len(messages_list) % 50 == 0:
+                        stats["status"] = f"Fetching ({len(messages_list)})..."
+                        update_status_message()
+            except Exception as fe:
+                logger.error(f"Error fetching history: {fe}")
+                stats["status"] = f"Fetch Error: {str(fe)[:25]}"
+                update_status_message(is_done=True)
+                await client.disconnect()
+                return
+
+            if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
+                stats["status"] = "Cancelled"
+                update_status_message(is_done=True)
+                await client.disconnect()
+                return
+                
+            messages_list.reverse()
+            total = len(messages_list)
+            
             if total == 0:
                 stats["status"] = "Source chat is empty"
                 update_status_message(is_done=True)
                 await client.disconnect()
                 return
                 
+            stats["status"] = "Forwarding"
+            update_status_message()
+            
             count = 0
-            async for msg in client.get_chat_history(resolved_chat_id, reverse=True):
+            for msg in messages_list:
                 if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
                     stats["status"] = "Cancelled"
                     update_status_message(is_done=True)
@@ -510,7 +541,7 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
                     
                 count += 1
                 stats["fetched"] += 1
-                stats["progress"] = int((count / total) * 100)
+                stats["progress"] = int((count / total) * 100) if total > 0 else 100
                 
                 # Apply Type Filters
                 is_matched = True
