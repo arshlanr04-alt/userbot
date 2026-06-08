@@ -612,29 +612,52 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
                             if new_caption:
                                 new_caption = new_caption.replace(word, "")
                                 
-                    # Send message copy or forward tag
-                    if filters.get("forward_tag", False):
-                        # Forward (shows forwarded from header)
-                        await client.forward_messages(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_ids=msg.id)
-                    else:
-                        # Copy (strips forward tag)
-                        if msg.text:
-                            text_content = msg.text
-                            if remove_words:
-                                for word in remove_words:
-                                    text_content = text_content.replace(word, "")
-                                await client.send_message(chat_id=target_chat_id, text=text_content)
+                    # Send message copy or forward tag with robust FloodWait retry loop
+                    max_retries = 3
+                    retry_count = 0
+                    sent_successfully = False
+                    
+                    while retry_count < max_retries and not sent_successfully:
+                        if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
+                            break
+                        try:
+                            if filters.get("forward_tag", False):
+                                # Forward (shows forwarded from header)
+                                await client.forward_messages(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_ids=msg.id)
                             else:
-                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
-                        else:
-                            if new_caption:
-                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id, caption=new_caption)
+                                # Copy (strips forward tag)
+                                if msg.text:
+                                    text_content = msg.text
+                                    if remove_words:
+                                        for word in remove_words:
+                                            text_content = text_content.replace(word, "")
+                                        await client.send_message(chat_id=target_chat_id, text=text_content)
+                                    else:
+                                        await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
+                                else:
+                                    if new_caption:
+                                        await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id, caption=new_caption)
+                                    else:
+                                        await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
+                            stats["forwarded"] += 1
+                            sent_successfully = True
+                        except Exception as fe:
+                            classname = fe.__class__.__name__
+                            if classname == "FloodWait":
+                                sleep_dur = getattr(fe, "value", 10)
+                                retry_count += 1
+                                logger.warning(f"FloodWait hit on message {msg.id}! Sleeping for {sleep_dur} seconds (attempt {retry_count}/{max_retries}).")
+                                stats["status"] = f"FloodWait ({sleep_dur}s)"
+                                update_status_message()
+                                await asyncio.sleep(sleep_dur)
+                                stats["status"] = "Forwarding"
+                                update_status_message()
                             else:
-                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
-                                
-                    stats["forwarded"] += 1
+                                logger.error(f"Failed to forward message {msg.id}: {fe}")
+                                stats["skipped"] += 1
+                                break
                 except Exception as fe:
-                    logger.error(f"Failed to forward message {msg.id}: {fe}")
+                    logger.error(f"Failed to process or forward message {msg.id}: {fe}")
                     stats["skipped"] += 1
                     
                 update_status_message(is_done=(count == total))
