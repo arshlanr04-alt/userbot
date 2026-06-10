@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import logging
 import asyncio
@@ -31,6 +32,10 @@ CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 # Temporary store for ongoing userbot login attempts
 # format: { user_id: { "client": Client, "phone": str, "phone_code_hash": str, "simulation": bool } }
 temp_userbot_logins = {}
+
+# Rate limit / cooldown for userbot login attempts
+last_login_attempt_time = 0
+LOGIN_COOLDOWN_SECONDS = 900 # 15 minutes
 
 # Temporary store for /forward confirmations
 temp_forward_confirms = {}
@@ -1079,6 +1084,136 @@ def check_client_source_access(user_id, source_id):
             return False, f"❌ HTTP error checking custom bot access: {e}", None
 
     return False, "❌ No active bot or userbot available to verify access.", None
+
+# --- ERROR MODERATION & ADMIN NOTIFICATION HELPERS ---
+def get_moderated_error_message(e):
+    """
+    Returns a premium, polite, and user-friendly error message based on the exception.
+    """
+    import re
+    err_str = str(e)
+    
+    # Check for FloodWait or FLOOD_WAIT in message
+    flood_match = re.search(r"FLOOD_WAIT_(\d+)", err_str, re.IGNORECASE)
+    if not flood_match and hasattr(e, "value"):
+        flood_match = re.search(r"(\d+)", str(e.value))
+    
+    if flood_match or "flood" in err_str.lower():
+        seconds = 0
+        if flood_match:
+            try:
+                seconds = int(flood_match.group(1))
+            except:
+                pass
+        if not seconds and hasattr(e, "value"):
+            try:
+                seconds = int(e.value)
+            except:
+                pass
+        
+        if seconds > 0:
+            minutes = (seconds + 59) // 60
+            return (
+                f"⚠️ <b>System Overloaded</b>\n\n"
+                f"The bot is currently overloaded. Please wait and try again after {minutes} minute{'s' if minutes > 1 else ''}."
+            )
+        else:
+            return (
+                f"⚠️ <b>System Overloaded</b>\n\n"
+                f"The bot is currently overloaded. Please wait and try again after a few minutes."
+            )
+            
+    # Check for other common Telegram API errors
+    err_lower = err_str.lower()
+    if "phone_number_invalid" in err_lower:
+        return (
+            f"❌ <b>Invalid Phone Number</b>\n\n"
+            f"The phone number you entered is invalid. Please make sure you included the correct country code and try again."
+        )
+    if "phone_number_banned" in err_lower:
+        return (
+            f"❌ <b>Account Restricted</b>\n\n"
+            f"This phone number is restricted or banned by Telegram."
+        )
+    if "phone_code_invalid" in err_lower or "phone_code_expired" in err_lower:
+        return (
+            f"❌ <b>Verification Code Error</b>\n\n"
+            f"The code you entered is invalid or has expired. Please request a new code and try again."
+        )
+    if "password_hash_invalid" in err_lower or "password_invalid" in err_lower:
+        return (
+            f"❌ <b>Incorrect 2FA Password</b>\n\n"
+            f"The 2FA password you entered is incorrect. Please check your cloud password and try again."
+        )
+    if "api_id_invalid" in err_lower or "api_hash_invalid" in err_lower:
+        return (
+            f"❌ <b>Configuration Error</b>\n\n"
+            f"There is a configuration mismatch with the Telegram API credentials. Please contact administration."
+        )
+        
+    # Generic moderated error message
+    return (
+        f"❌ <b>An Error Occurred</b>\n\n"
+        f"We encountered a temporary technical issue while processing your request. "
+        f"The administrators have been notified. Please try again in a few minutes."
+    )
+
+def notify_admins_of_error(message, error, moderated_user_msg, context_info=None):
+    """
+    Notifies all admins in config['admin_ids'] of the error with user details,
+    the user's input, the raw exception, and the moderated message sent to the user.
+    """
+    user_id = message.from_user.id
+    first_name = message.from_user.first_name or "N/A"
+    last_name = message.from_user.last_name or ""
+    username = message.from_user.username or "N/A"
+    full_name = f"{first_name} {last_name}".strip()
+    
+    user_input = message.text or "[Non-text message]"
+    
+    admin_msg = (
+        f"🚨 <b>Error Alert</b>\n\n"
+        f"<b>👤 Cause (User Account):</b>\n"
+        f"• User ID: <code>{user_id}</code>\n"
+        f"• Name: {full_name}\n"
+        f"• Username: @{username}\n"
+    )
+    if context_info:
+        admin_msg += f"• Context: <code>{context_info}</code>\n"
+        
+    admin_msg += (
+        f"\n<b>📥 User Input Message:</b>\n"
+        f"<code>{user_input}</code>\n\n"
+        f"<b>📤 Moderated Message User Received:</b>\n"
+        f"<blockquote>{moderated_user_msg}</blockquote>\n\n"
+        f"<b>💥 Actual Raw Error:</b>\n"
+        f"<code>{error}</code>"
+    )
+    
+    admin_ids = config.get("admin_ids", [])
+    for admin_id in admin_ids:
+        try:
+            bot.send_message(admin_id, admin_msg, parse_mode="HTML")
+        except Exception as notify_err:
+            logger.error(f"Failed to notify admin {admin_id}: {notify_err}")
+
+def handle_user_error(message, error, context_info):
+    """
+    Moderates the error for the user, replies with the moderated message,
+    and notifies all admins with details of the user, the input message,
+    the actual raw error, and the moderated response message.
+    """
+    # 1. Get moderated user-friendly error message
+    moderated_msg = get_moderated_error_message(error)
+    
+    # 2. Send the moderated message to the user
+    try:
+        bot.reply_to(message, moderated_msg, parse_mode="HTML")
+    except Exception as reply_err:
+        logger.error(f"Failed to reply with moderated error: {reply_err}")
+        
+    # 3. Notify admins
+    notify_admins_of_error(message, error, moderated_msg, context_info)
 
 # --- KEYBOARDS ---
 def get_user_welcome_markup(user_id):
@@ -2173,11 +2308,29 @@ def handle_admin_inputs(message):
             send_bots_settings_panel(message.chat.id, user_id)
         except Exception as e:
             logger.error(f"Error verifying/saving linked bot: {e}")
-            bot.reply_to(message, f"❌ Failed to verify or save bot token: <code>{e}</code>", parse_mode="HTML")
+            handle_user_error(message, e, "Verifying/saving linked bot token")
             user_states[user_id] = None
             send_bots_settings_panel(message.chat.id, user_id)
             
     elif state == "WAITING_FOR_PHONE":
+        global last_login_attempt_time
+        
+        # Check login cooldown
+        time_elapsed = time.time() - last_login_attempt_time
+        if time_elapsed < LOGIN_COOLDOWN_SECONDS:
+            remaining = int(LOGIN_COOLDOWN_SECONDS - time_elapsed)
+            rem_min = remaining // 60
+            rem_sec = remaining % 60
+            bot.reply_to(
+                message,
+                f"❌ <b>Rate Limit Protection: Cooldown Active</b>\n\n"
+                f"To prevent Telegram API ID/Hash rate limits, please wait 15 minutes between login attempts.\n\n"
+                f"⏳ Please try again in <b>{rem_min}m {rem_sec}s</b>.",
+                parse_mode="HTML",
+                reply_markup=get_cancel_markup()
+            )
+            return
+
         phone = message.text.strip() if message.text else ""
         if not phone or not phone.startswith("+") or not phone[1:].replace(" ", "").isdigit():
             bot.reply_to(
@@ -2198,6 +2351,8 @@ def handle_admin_inputs(message):
         if PYROGRAM_AVAILABLE and API_ID and API_HASH:
             bot.reply_to(message, "⏳ <b>Connecting to Telegram... Please wait.</b>", parse_mode="HTML")
             try:
+                # Update last attempt time to enforce cooldown
+                last_login_attempt_time = time.time()
                 # Initialize Pyrogram Client inside the background loop's context
                 async def do_send_code():
                     c = Client(
@@ -2229,13 +2384,7 @@ def handle_admin_inputs(message):
                 )
             except Exception as e:
                 logger.error(f"Pyrogram code send error: {e}")
-                bot.reply_to(
-                    message,
-                    f"❌ <b>Telegram Connection Error</b>\n"
-                    f"Failed to request login code: <code>{e}</code>\n\n"
-                    f"Please check your Telegram API ID/Hash configurations.",
-                    parse_mode="HTML"
-                )
+                handle_user_error(message, e, "Requesting userbot login code")
                 user_states[user_id] = None
                 send_bots_settings_panel(message.chat.id)
         else:
@@ -2351,13 +2500,7 @@ def handle_admin_inputs(message):
                     send_bots_settings_panel(message.chat.id)
             except Exception as e:
                 logger.error(f"Pyrogram sign-in error: {e}")
-                bot.reply_to(
-                    message,
-                    f"❌ <b>Sign-in Failed</b>\n"
-                    f"Error: <code>{e}</code>\n\n"
-                    f"Please click Add Userbot to start over.",
-                    parse_mode="HTML"
-                )
+                handle_user_error(message, e, "Userbot login sign-in code verification")
                 try:
                     run_async(client.disconnect())
                 except:
@@ -2410,13 +2553,7 @@ def handle_admin_inputs(message):
             send_bots_settings_panel(message.chat.id)
         except Exception as e:
             logger.error(f"Pyrogram check password error: {e}")
-            bot.reply_to(
-                message,
-                f"❌ <b>Verification Failed</b>\n"
-                f"Invalid cloud password: <code>{e}</code>\n\n"
-                f"Please click Add Userbot to try again.",
-                parse_mode="HTML"
-            )
+            handle_user_error(message, e, "Userbot 2FA cloud password verification")
             try:
                 run_async(client.disconnect())
             except:
@@ -2483,7 +2620,7 @@ def handle_admin_inputs(message):
                 send_channels_settings_panel(message.chat.id, user_id)
             except Exception as e:
                 logger.error(f"Error saving target chat to DB: {e}")
-                bot.reply_to(message, f"❌ Failed to save target chat: <code>{e}</code>", parse_mode="HTML")
+                handle_user_error(message, e, "Saving target chat ID/username")
                 user_states[user_id] = None
                 send_channels_settings_panel(message.chat.id, user_id)
         else:
