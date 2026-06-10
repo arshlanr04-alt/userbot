@@ -487,9 +487,11 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
                 logger.warning(f"Failed to fetch dialogs in forwarding task: {e}")
             
             # Resolve source chat entity (can be ID or username)
+            is_protected = False
             try:
                 resolved_chat = await client.get_chat(source_id)
                 resolved_chat_id = resolved_chat.id
+                is_protected = getattr(resolved_chat, "has_protected_content", False)
             except Exception as e:
                 logger.error(f"Failed to resolve source chat entity: {e}")
                 resolved_chat_id = source_id
@@ -621,11 +623,8 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
                         if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
                             break
                         try:
-                            if filters.get("forward_tag", False):
-                                # Forward (shows forwarded from header)
-                                await client.forward_messages(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_ids=msg.id)
-                            else:
-                                # Copy (strips forward tag)
+                            if is_protected and not filters.get("forward_tag", False):
+                                # Copy behavior for protected chat
                                 if msg.text:
                                     text_content = msg.text
                                     if remove_words:
@@ -633,12 +632,94 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
                                             text_content = text_content.replace(word, "")
                                         await client.send_message(chat_id=target_chat_id, text=text_content)
                                     else:
-                                        await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
+                                        await client.send_message(chat_id=target_chat_id, text=msg.text, entities=msg.entities)
                                 else:
-                                    if new_caption:
-                                        await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id, caption=new_caption)
+                                    # Media message: download and upload
+                                    local_path = await client.download_media(msg)
+                                    if local_path and os.path.exists(local_path):
+                                        try:
+                                            caption_entities = msg.caption_entities if new_caption == (msg.caption or "") else None
+                                            if msg.photo:
+                                                await client.send_photo(chat_id=target_chat_id, photo=local_path, caption=new_caption, caption_entities=caption_entities)
+                                            elif msg.video:
+                                                await client.send_video(chat_id=target_chat_id, video=local_path, caption=new_caption, caption_entities=caption_entities)
+                                            elif msg.document:
+                                                await client.send_document(chat_id=target_chat_id, document=local_path, caption=new_caption, caption_entities=caption_entities)
+                                            elif msg.audio:
+                                                await client.send_audio(chat_id=target_chat_id, audio=local_path, caption=new_caption, caption_entities=caption_entities)
+                                            elif msg.voice:
+                                                await client.send_voice(chat_id=target_chat_id, voice=local_path, caption=new_caption, caption_entities=caption_entities)
+                                            elif msg.animation:
+                                                await client.send_animation(chat_id=target_chat_id, animation=local_path, caption=new_caption, caption_entities=caption_entities)
+                                            elif msg.sticker:
+                                                await client.send_sticker(chat_id=target_chat_id, sticker=local_path)
+                                            else:
+                                                raise ValueError("Unsupported media type for protected flow.")
+                                        finally:
+                                            if os.path.exists(local_path):
+                                                try:
+                                                    os.remove(local_path)
+                                                except:
+                                                    pass
                                     else:
-                                        await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
+                                        raise ValueError("Download failed for protected media.")
+                            else:
+                                try:
+                                    if filters.get("forward_tag", False):
+                                        # Forward (shows forwarded from header)
+                                        await client.forward_messages(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_ids=msg.id)
+                                    else:
+                                        # Copy (strips forward tag)
+                                        if msg.text:
+                                            text_content = msg.text
+                                            if remove_words:
+                                                for word in remove_words:
+                                                    text_content = text_content.replace(word, "")
+                                                await client.send_message(chat_id=target_chat_id, text=text_content)
+                                            else:
+                                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
+                                        else:
+                                            if new_caption:
+                                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id, caption=new_caption)
+                                            else:
+                                                await client.copy_message(chat_id=target_chat_id, from_chat_id=resolved_chat_id, message_id=msg.id)
+                                except Exception as copy_err:
+                                    logger.warning(f"Standard forwarding failed for message {msg.id}: {copy_err}. Retrying with download/upload fallback.")
+                                    if msg.text:
+                                        text_content = msg.text
+                                        if remove_words:
+                                            for word in remove_words:
+                                                text_content = text_content.replace(word, "")
+                                        await client.send_message(chat_id=target_chat_id, text=text_content)
+                                    else:
+                                        local_path = await client.download_media(msg)
+                                        if local_path and os.path.exists(local_path):
+                                            try:
+                                                caption_entities = msg.caption_entities if new_caption == (msg.caption or "") else None
+                                                if msg.photo:
+                                                    await client.send_photo(chat_id=target_chat_id, photo=local_path, caption=new_caption, caption_entities=caption_entities)
+                                                elif msg.video:
+                                                    await client.send_video(chat_id=target_chat_id, video=local_path, caption=new_caption, caption_entities=caption_entities)
+                                                elif msg.document:
+                                                    await client.send_document(chat_id=target_chat_id, document=local_path, caption=new_caption, caption_entities=caption_entities)
+                                                elif msg.audio:
+                                                    await client.send_audio(chat_id=target_chat_id, audio=local_path, caption=new_caption, caption_entities=caption_entities)
+                                                elif msg.voice:
+                                                    await client.send_voice(chat_id=target_chat_id, voice=local_path, caption=new_caption, caption_entities=caption_entities)
+                                                elif msg.animation:
+                                                    await client.send_animation(chat_id=target_chat_id, animation=local_path, caption=new_caption, caption_entities=caption_entities)
+                                                elif msg.sticker:
+                                                    await client.send_sticker(chat_id=target_chat_id, sticker=local_path)
+                                                else:
+                                                    raise ValueError("Unsupported media type for fallback flow.")
+                                            finally:
+                                                if os.path.exists(local_path):
+                                                    try:
+                                                        os.remove(local_path)
+                                                    except:
+                                                        pass
+                                        else:
+                                            raise copy_err
                             stats["forwarded"] += 1
                             sent_successfully = True
                         except Exception as fe:
@@ -1113,6 +1194,8 @@ def show_settings_panel(call):
             )
             return
         except Exception as e:
+            if "message is not modified" in str(e):
+                return
             logger.error(f"Error editing caption to settings panel: {e}")
             
     # Text fallback
@@ -1125,7 +1208,8 @@ def show_settings_panel(call):
             parse_mode="HTML"
         )
     except Exception as e:
-        logger.error(f"Error editing text to settings panel: {e}")
+        if "message is not modified" not in str(e):
+            logger.error(f"Error editing text to settings panel: {e}")
 
 def show_welcome_panel(call):
     """Transition from Settings Panel back to the Main Welcome panel by editing in place."""
@@ -1150,6 +1234,8 @@ def show_welcome_panel(call):
             )
             return
         except Exception as e:
+            if "message is not modified" in str(e):
+                return
             logger.error(f"Error editing caption back to welcome panel: {e}")
             
     # Text fallback
@@ -1162,7 +1248,8 @@ def show_welcome_panel(call):
             parse_mode="HTML"
         )
     except Exception as e:
-        logger.error(f"Error editing text back to welcome panel: {e}")
+        if "message is not modified" not in str(e):
+            logger.error(f"Error editing text back to welcome panel: {e}")
 
 def get_bots_settings_markup(user_id):
     """Returns the keyboard layout for the Bots configuration submenu dynamically showing linked bots."""
@@ -1801,7 +1888,18 @@ def send_welcome_message(chat_id, user):
             logger.info(f"Sent photo welcome message to user {user.id}")
             return
         except Exception as e:
-            logger.error(f"Failed to send photo welcome to {user.id}: {e}. Falling back to text-only.")
+            logger.error(f"Failed to send photo welcome to {user.id}: {e}. Retrying photo with plain text caption...")
+            try:
+                bot.send_photo(
+                    chat_id,
+                    welcome_photo,
+                    caption=formatted_text,
+                    reply_markup=markup
+                )
+                logger.info(f"Sent photo welcome message (plain text) to user {user.id}")
+                return
+            except Exception as pe2:
+                logger.error(f"Failed to send photo even as plain text: {pe2}. Falling back to text-only.")
             # Fall through to text-only if photo fails
     
     # Text-only fallback
@@ -1814,7 +1912,16 @@ def send_welcome_message(chat_id, user):
         )
         logger.info(f"Sent text fallback welcome message to user {user.id}")
     except Exception as e:
-        logger.critical(f"Failed to send welcome message entirely: {e}")
+        logger.error(f"Failed to send HTML welcome message to {user.id}: {e}. Retrying as plain text...")
+        try:
+            bot.send_message(
+                chat_id,
+                formatted_text,
+                reply_markup=markup
+            )
+            logger.info(f"Sent plain text fallback welcome message to user {user.id}")
+        except Exception as e2:
+            logger.critical(f"Failed to send welcome message entirely: {e2}")
 
 # --- COMMAND HANDLERS ---
 @bot.message_handler(commands=["start"])
@@ -1917,6 +2024,39 @@ def cmd_forward(message):
         "</blockquote>"
     )
     bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+@bot.message_handler(commands=["stop"])
+def cmd_stop(message):
+    """Cancels the ongoing forwarding task for the user."""
+    user_id = message.from_user.id
+    if user_id in active_forwarding_tasks:
+        active_forwarding_tasks[user_id]["cancelled"] = True
+        bot.reply_to(
+            message,
+            "🛑 <b>Cancelling ongoing forwarding task...</b>",
+            parse_mode="HTML"
+        )
+    else:
+        bot.reply_to(
+            message,
+            "❌ <b>No active forwarding task found to stop.</b>",
+            parse_mode="HTML"
+        )
+
+@bot.message_handler(commands=["setting", "settings"])
+def cmd_settings(message):
+    """Handles the /setting and /settings commands to open the settings panel directly."""
+    settings_text = (
+        "<b>HERE IS THE SETTINGS PANEL⚙️</b>\n\n"
+        "<b>CHANGE YOUR SETTINGS AS YOUR WISH👇</b>"
+    )
+    markup = get_settings_markup()
+    bot.send_message(
+        message.chat.id,
+        settings_text,
+        reply_markup=markup,
+        parse_mode="HTML"
+    )
 
 # --- STATE-BASED MESSAGE HANDLER ---
 @bot.message_handler(content_types=['text', 'photo', 'audio', 'document', 'video', 'video_note', 'voice', 'location', 'contact', 'sticker'], func=lambda msg: msg.from_user.id in user_states and user_states[msg.from_user.id] is not None)
