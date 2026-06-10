@@ -478,6 +478,11 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
         
         try:
             await client.connect()
+            # Fetch and set client.me to avoid NoneType.is_premium errors in Pyrogram internal media downloads
+            try:
+                client.me = await client.get_me()
+            except Exception as me_err:
+                logger.warning(f"Failed to fetch client.me: {me_err}")
             
             # Populate peer database cache for numeric IDs
             try:
