@@ -940,9 +940,12 @@ original_reply_to = bot.reply_to
 
 def get_config_key_for_text(text):
     if not text:
-        return "welcome_text"
+        return None
     text_lower = text.lower()
-    if "help" in text_lower:
+    # Check if the text matches the welcome message format or keywords (Welcome panel is user-specific with name placeholders)
+    if "welcome" in text_lower or "explore more" in text_lower or "hi " in text_lower:
+        return "welcome_text"
+    elif "help" in text_lower:
         return "user_help"
     elif "about" in text_lower:
         return "user_about"
@@ -950,16 +953,18 @@ def get_config_key_for_text(text):
         return "user_status"
     elif "guide" in text_lower or "how to use" in text_lower:
         return "user_how_to_use"
-    return "welcome_text"
+    return None
 
 def add_edit_button_to_markup(chat_id, reply_markup, text=""):
     if is_admin(chat_id):
+        config_key = get_config_key_for_text(text)
+        if config_key is None:
+            return reply_markup
+            
         if reply_markup is None:
             reply_markup = InlineKeyboardMarkup()
         elif not isinstance(reply_markup, InlineKeyboardMarkup):
             return reply_markup
-        
-        config_key = get_config_key_for_text(text)
         
         # Check if Edit button is already there
         has_edit = False
