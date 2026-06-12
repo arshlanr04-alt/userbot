@@ -2991,7 +2991,12 @@ def handle_callbacks(call):
         return
     
     # ─── USER BUTTON CALLBACKS ───
-    if data.startswith("user_"):
+    if data == "user_back_to_welcome":
+        bot.answer_callback_query(call.id)
+        show_welcome_panel(call)
+        return
+
+    elif data.startswith("user_"):
         bot.answer_callback_query(call.id)
         
         if data == "user_settings":
@@ -3005,10 +3010,37 @@ def handle_callbacks(call):
             # Fallback to default messages
             response_text = DEFAULT_CONFIG["button_messages"].get(data, "Response not configured.")
             
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("◀️ Back", callback_data="user_back_to_welcome"))
+        
+        if is_admin(user_id):
+            markup.add(InlineKeyboardButton("✏️ Edit Text", callback_data="edit_this_msg"))
+            
+        has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
+        
+        if has_photo:
+            try:
+                bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=call.message.message_id,
+                    caption=response_text,
+                    reply_markup=markup,
+                    parse_mode="HTML"
+                )
+                return
+            except Exception as e:
+                logger.error(f"Error editing caption: {e}")
+                
         try:
-            bot.send_message(chat_id, response_text, parse_mode="HTML")
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=response_text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
         except Exception as e:
-            logger.error(f"Error sending callback reply: {e}")
+            logger.error(f"Error editing text: {e}")
             
     # ─── SETTINGS PANEL CALLBACKS ───
     elif data.startswith("settings_"):
