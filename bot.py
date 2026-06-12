@@ -933,7 +933,8 @@ def is_admin(user_id):
     """Checks if a user ID is listed in the admin list."""
     return user_id in config.get("admin_ids", [])
 
-# --- WRAPPED SEND METHODS FOR ADMIN EDIT BUTTON ---
+import hashlib
+
 original_send_message = bot.send_message
 original_send_photo = bot.send_photo
 original_reply_to = bot.reply_to
@@ -942,7 +943,6 @@ def get_config_key_for_text(text):
     if not text:
         return "welcome_text"
     text_lower = text.lower()
-    # Check if the text matches the welcome message format or keywords (Welcome panel is user-specific with name placeholders)
     if "welcome" in text_lower or "explore more" in text_lower or "hi " in text_lower:
         return "welcome_text"
     elif "help" in text_lower:
@@ -953,7 +953,10 @@ def get_config_key_for_text(text):
         return "user_status"
     elif "guide" in text_lower or "how to use" in text_lower:
         return "user_how_to_use"
-    return "welcome_text"
+    
+    # Generate an MD5 hash of the original text for dynamic custom messages
+    h = hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
+    return f"hash_{h}"
 
 def add_edit_button_to_markup(chat_id, reply_markup, text=""):
     if is_admin(chat_id):
@@ -976,18 +979,31 @@ def add_edit_button_to_markup(chat_id, reply_markup, text=""):
             reply_markup.add(InlineKeyboardButton("✏️ Edit Text", callback_data=f"edit_this_msg_{config_key}"))
     return reply_markup
 
+def get_custom_text(text):
+    if not text:
+        return text
+    config_key = get_config_key_for_text(text)
+    if config_key.startswith("hash_"):
+        btn_msgs = config.get("button_messages", {})
+        return btn_msgs.get(config_key, text)
+    return text
+
 def wrapped_send_message(chat_id, text, *args, **kwargs):
+    text = get_custom_text(text)
     reply_markup = kwargs.get("reply_markup")
     kwargs["reply_markup"] = add_edit_button_to_markup(chat_id, reply_markup, text)
     return original_send_message(chat_id, text, *args, **kwargs)
 
 def wrapped_send_photo(chat_id, photo, *args, **kwargs):
-    reply_markup = kwargs.get("reply_markup")
     caption = kwargs.get("caption", "")
+    caption = get_custom_text(caption)
+    kwargs["caption"] = caption
+    reply_markup = kwargs.get("reply_markup")
     kwargs["reply_markup"] = add_edit_button_to_markup(chat_id, reply_markup, caption)
     return original_send_photo(chat_id, photo, *args, **kwargs)
 
 def wrapped_reply_to(message, text, *args, **kwargs):
+    text = get_custom_text(text)
     reply_markup = kwargs.get("reply_markup")
     kwargs["reply_markup"] = add_edit_button_to_markup(message.chat.id, reply_markup, text)
     return original_reply_to(message, text, *args, **kwargs)
