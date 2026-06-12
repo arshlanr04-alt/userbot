@@ -2521,9 +2521,7 @@ def handle_admin_inputs(message):
             rem_sec = remaining % 60
             bot.reply_to(
                 message,
-                f"❌ <b>Rate Limit Protection: Cooldown Active</b>\n\n"
-                f"To prevent Telegram API ID/Hash rate limits, please wait 15 minutes between login attempts.\n\n"
-                f"⏳ Please try again in <b>{rem_min}m {rem_sec}s</b>.",
+                f" <b>too many user requests please try again in 15 minutes</b>\n\n",
                 parse_mode="HTML",
                 reply_markup=get_cancel_markup()
             )
