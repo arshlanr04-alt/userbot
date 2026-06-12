@@ -351,7 +351,7 @@ def get_progress_bar(pct):
     hollow = 20 - filled
     return "◆" * filled + "◇" * hollow
 
-async def run_forwarding_task(user_id, source_id, target_chat_id, status_message_id, chat_id, last_message_id=1000):
+async def run_forwarding_task(user_id, source_id, target_chat_id, status_message_id, chat_id):
     """Background task that runs the forwarding logic from oldest to newest messages."""
     stats = {
         "fetched": 0,
@@ -511,55 +511,28 @@ async def run_forwarding_task(user_id, source_id, target_chat_id, status_message
             update_status_message()
             
             messages_list = []
-            is_bot_client = client.me.is_bot if client.me else True
-            
-            if is_bot_client:
-                stats["status"] = "Fetching messages (Bot)..."
-                update_status_message()
-                
-                # Fetch in batches of 200 using get_messages (allowed for bots)
-                chunk_size = 200
-                for start_id in range(1, last_message_id + 1, chunk_size):
+            try:
+                async for msg in client.get_chat_history(resolved_chat_id):
                     if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
                         break
-                    end_id = min(start_id + chunk_size, last_message_id + 1)
-                    ids = list(range(start_id, end_id))
-                    try:
-                        chunk_msgs = await client.get_messages(resolved_chat_id, message_ids=ids)
-                        if not isinstance(chunk_msgs, list):
-                            chunk_msgs = [chunk_msgs]
-                        for msg in chunk_msgs:
-                            if msg and not msg.empty:
-                                messages_list.append(msg)
-                    except Exception as chunk_err:
-                        logger.warning(f"Failed to fetch messages {start_id}-{end_id}: {chunk_err}")
-                    
-                    stats["status"] = f"Fetching ({len(messages_list)})..."
-                    update_status_message()
-            else:
-                # Userbot client uses standard get_chat_history
-                try:
-                    async for msg in client.get_chat_history(resolved_chat_id):
-                        if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
-                            break
-                        messages_list.append(msg)
-                        if len(messages_list) % 50 == 0:
-                            stats["status"] = f"Fetching ({len(messages_list)})..."
-                            update_status_message()
-                    # get_chat_history returns from newest to oldest, so we reverse it
-                    messages_list.reverse()
-                except Exception as fe:
-                    logger.error(f"Error fetching history: {fe}")
-                    stats["status"] = f"Fetch Error: {str(fe)[:25]}"
-                    update_status_message(is_done=True)
-                    await client.disconnect()
-                    return
+                    messages_list.append(msg)
+                    if len(messages_list) % 50 == 0:
+                        stats["status"] = f"Fetching ({len(messages_list)})..."
+                        update_status_message()
+            except Exception as fe:
+                logger.error(f"Error fetching history: {fe}")
+                stats["status"] = f"Fetch Error: {str(fe)[:25]}"
+                update_status_message(is_done=True)
+                await client.disconnect()
+                return
 
             if active_forwarding_tasks.get(user_id, {}).get("cancelled"):
                 stats["status"] = "Cancelled"
                 update_status_message(is_done=True)
                 await client.disconnect()
                 return
+                
+            messages_list.reverse()
             total = len(messages_list)
             
             if total == 0:
@@ -975,7 +948,7 @@ def parse_telegram_link(text):
     Robust Telegram link parser.
     Supports message links (e.g. t.me/c/12345/678, t.me/mychat/678)
     and chat/channel links (e.g. t.me/c/12345, t.me/mychat).
-    Returns (source_id, source_title, message_id).
+    Returns (source_id, source_title).
     """
     import re
     cleaned = text.strip()
@@ -984,17 +957,16 @@ def parse_telegram_link(text):
     match_msg = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/(?:c/)?([^/?#]+)/(\d+)", cleaned)
     if match_msg:
         chat_identifier = match_msg.group(1)
-        msg_id = int(match_msg.group(2))
         is_private = "/c/" in cleaned
         if is_private:
             try:
-                return int(f"-100{chat_identifier}"), "private", msg_id
+                return int(f"-100{chat_identifier}"), "private"
             except ValueError:
-                return f"@{chat_identifier}", f"@{chat_identifier}", msg_id
+                return f"@{chat_identifier}", f"@{chat_identifier}"
         else:
             if chat_identifier.isdigit():
-                return int(chat_identifier), f"Chat {chat_identifier}", msg_id
-            return f"@{chat_identifier}", f"@{chat_identifier}", msg_id
+                return int(chat_identifier), f"Chat {chat_identifier}"
+            return f"@{chat_identifier}", f"@{chat_identifier}"
             
     # 2. Check chat link (e.g., t.me/mygroup or t.me/c/123456)
     match_chat = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/(?:c/)?([^/?#]+)", cleaned)
@@ -1002,19 +974,19 @@ def parse_telegram_link(text):
         chat_identifier = match_chat.group(1)
         # Exclude bot commands like /start or /cancel
         if chat_identifier.startswith("/") or chat_identifier.lower() in ["start", "cancel", "admin", "myid", "forward"]:
-            return None, None, None
+            return None, None
         is_private = "/c/" in cleaned
         if is_private:
             try:
-                return int(f"-100{chat_identifier}"), "private", None
+                return int(f"-100{chat_identifier}"), "private"
             except ValueError:
-                return f"@{chat_identifier}", f"@{chat_identifier}", None
+                return f"@{chat_identifier}", f"@{chat_identifier}"
         else:
             if chat_identifier.isdigit():
-                return int(chat_identifier), f"Chat {chat_identifier}", None
-            return f"@{chat_identifier}", f"@{chat_identifier}", None
+                return int(chat_identifier), f"Chat {chat_identifier}"
+            return f"@{chat_identifier}", f"@{chat_identifier}"
             
-    return None, None, None
+    return None, None
 
 def check_client_source_access(user_id, source_id):
     """
@@ -1434,13 +1406,11 @@ def get_bots_settings_markup(user_id):
         (user_id,), fetch="all"
     )
     
-    # If bots exist, show them. Otherwise show the add button.
+    # If bots exist, show them.
     if linked_bots:
         for b_id, b_name, b_username in linked_bots:
             display_name = b_name if b_name else f"@{b_username}"
             markup.add(InlineKeyboardButton(display_name, callback_data=f"manage_bot_{b_id}"))
-    else:
-        markup.add(InlineKeyboardButton("➕ Add Bot ➕", callback_data="settings_bots_add"))
             
     # If userbots exist, show them. Otherwise show the add button.
     if linked_userbots:
@@ -2226,6 +2196,20 @@ def cmd_settings(message):
         parse_mode="HTML"
     )
 
+@bot.message_handler(commands=["addbot"])
+def cmd_addbot(message):
+    """Handles the /addbot command to start custom bot linking directly."""
+    user_id = message.from_user.id
+    user_states[user_id] = "WAITING_FOR_BOT_TOKEN"
+    bot.send_message(
+        message.chat.id,
+        "🤖 <b>Adding Custom Bot</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        "Please send the Bot Token (from @BotFather) of the bot you want to add.\n\n"
+        "<i>This bot will be used to forward content from target groups to source groups.</i>",
+        reply_markup=get_cancel_markup(),
+        parse_mode="HTML"
+    )
+
 # --- STATE-BASED MESSAGE HANDLER ---
 @bot.message_handler(content_types=['text', 'photo', 'audio', 'document', 'video', 'video_note', 'voice', 'location', 'contact', 'sticker'], func=lambda msg: msg.from_user.id in user_states and user_states[msg.from_user.id] is not None)
 def handle_admin_inputs(message):
@@ -2743,20 +2727,16 @@ def handle_admin_inputs(message):
             
         source_id = None
         source_title = None
-        last_message_id = 1000
         
         if message.forward_from_chat:
             source_id = message.forward_from_chat.id
             source_title = message.forward_from_chat.title or message.forward_from_chat.username or "Source Chat"
-            last_message_id = message.forward_from_message_id or 1000
         elif message.text:
             text = message.text.strip()
-            parsed_id, parsed_title, parsed_msg_id = parse_telegram_link(text)
+            parsed_id, parsed_title = parse_telegram_link(text)
             if parsed_id is not None:
                 source_id = parsed_id
                 source_title = parsed_title
-                if parsed_msg_id:
-                    last_message_id = parsed_msg_id
             else:
                 if (text.startswith("-") and text[1:].isdigit()) or text.isdigit():
                     source_id = int(text)
@@ -2803,8 +2783,7 @@ def handle_admin_inputs(message):
                 "source_title": source_title,
                 "target_chat_id": target_chat_id,
                 "target_title": target_title,
-                "bot_display": bot_display,
-                "last_message_id": last_message_id
+                "bot_display": bot_display
             }
             
             check_text = (
@@ -3113,8 +3092,7 @@ def handle_callbacks(call):
                 source_id=confirm_data["source_id"],
                 target_chat_id=confirm_data["target_chat_id"],
                 status_message_id=status_msg.message_id,
-                chat_id=chat_id,
-                last_message_id=confirm_data.get("last_message_id", 1000)
+                chat_id=chat_id
             ),
             background_loop
         )
