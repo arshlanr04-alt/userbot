@@ -938,37 +938,55 @@ original_send_message = bot.send_message
 original_send_photo = bot.send_photo
 original_reply_to = bot.reply_to
 
-def add_edit_button_to_markup(chat_id, reply_markup):
+def get_config_key_for_text(text):
+    if not text:
+        return "welcome_text"
+    text_lower = text.lower()
+    if "help" in text_lower:
+        return "user_help"
+    elif "about" in text_lower:
+        return "user_about"
+    elif "status" in text_lower or "processed" in text_lower:
+        return "user_status"
+    elif "guide" in text_lower or "how to use" in text_lower:
+        return "user_how_to_use"
+    return "welcome_text"
+
+def add_edit_button_to_markup(chat_id, reply_markup, text=""):
     if is_admin(chat_id):
         if reply_markup is None:
             reply_markup = InlineKeyboardMarkup()
         elif not isinstance(reply_markup, InlineKeyboardMarkup):
             return reply_markup
         
+        config_key = get_config_key_for_text(text)
+        
         # Check if Edit button is already there
         has_edit = False
         for row in reply_markup.keyboard:
             for btn in row:
-                if getattr(btn, "callback_data", None) == "edit_this_msg":
+                cb_data = getattr(btn, "callback_data", None)
+                if cb_data and cb_data.startswith("edit_this_msg_"):
                     has_edit = True
                     break
         if not has_edit:
-            reply_markup.add(InlineKeyboardButton("✏️ Edit Text", callback_data="edit_this_msg"))
+            reply_markup.add(InlineKeyboardButton("✏️ Edit Text", callback_data=f"edit_this_msg_{config_key}"))
     return reply_markup
 
 def wrapped_send_message(chat_id, text, *args, **kwargs):
     reply_markup = kwargs.get("reply_markup")
-    kwargs["reply_markup"] = add_edit_button_to_markup(chat_id, reply_markup)
+    kwargs["reply_markup"] = add_edit_button_to_markup(chat_id, reply_markup, text)
     return original_send_message(chat_id, text, *args, **kwargs)
 
 def wrapped_send_photo(chat_id, photo, *args, **kwargs):
     reply_markup = kwargs.get("reply_markup")
-    kwargs["reply_markup"] = add_edit_button_to_markup(chat_id, reply_markup)
+    caption = kwargs.get("caption", "")
+    kwargs["reply_markup"] = add_edit_button_to_markup(chat_id, reply_markup, caption)
     return original_send_photo(chat_id, photo, *args, **kwargs)
 
 def wrapped_reply_to(message, text, *args, **kwargs):
     reply_markup = kwargs.get("reply_markup")
-    kwargs["reply_markup"] = add_edit_button_to_markup(message.chat.id, reply_markup)
+    kwargs["reply_markup"] = add_edit_button_to_markup(message.chat.id, reply_markup, text)
     return original_reply_to(message, text, *args, **kwargs)
 
 bot.send_message = wrapped_send_message
@@ -2315,8 +2333,21 @@ def handle_admin_inputs(message):
             send_welcome_message(message.chat.id, message.from_user)
             return
             
-        target_msg_id = int(state.replace("EDITING_MSG_", ""))
+        # Format can be: EDITING_MSG_{config_key}_{message_id}
+        state_parts = state.replace("EDITING_MSG_", "").split("_")
+        target_msg_id = int(state_parts[-1])
+        config_key = "_".join(state_parts[:-1]) if len(state_parts) > 1 else "welcome_text"
+        
         new_text = message.text
+        
+        # Save to database config
+        if config_key == "welcome_text":
+            config["welcome_text"] = new_text
+        else:
+            if "button_messages" not in config:
+                config["button_messages"] = {}
+            config["button_messages"][config_key] = new_text
+        save_config(config)
         
         # Delete user's message
         try:
@@ -2327,7 +2358,14 @@ def handle_admin_inputs(message):
         # Delete the previous prompt (edit prompt)
         track_and_delete_last_menu(message.chat.id)
         
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Edit Text", callback_data="edit_this_msg")]])
+        # Determine appropriate reply markup based on config_key
+        markup = InlineKeyboardMarkup()
+        if config_key == "welcome_text":
+            markup = get_user_welcome_markup(user_id)
+        else:
+            markup.add(InlineKeyboardButton("◀️ Back", callback_data="user_back_to_welcome"))
+            if is_admin(user_id):
+                markup.add(InlineKeyboardButton("✏️ Edit Text", callback_data=f"edit_this_msg_{config_key}"))
             
         try:
             bot.edit_message_text(
@@ -2970,10 +3008,11 @@ def handle_callbacks(call):
     chat_id = call.message.chat.id
     data = call.data
 
-    if data == "edit_this_msg":
+    if data.startswith("edit_this_msg_"):
         bot.answer_callback_query(call.id)
         if is_admin(user_id):
-            user_states[user_id] = f"EDITING_MSG_{call.message.message_id}"
+            config_key = data.replace("edit_this_msg_", "")
+            user_states[user_id] = f"EDITING_MSG_{config_key}_{call.message.message_id}"
             track_and_delete_last_menu(chat_id)
             msg = bot.send_message(
                 chat_id,
@@ -3014,7 +3053,7 @@ def handle_callbacks(call):
         markup.add(InlineKeyboardButton("◀️ Back", callback_data="user_back_to_welcome"))
         
         if is_admin(user_id):
-            markup.add(InlineKeyboardButton("✏️ Edit Text", callback_data="edit_this_msg"))
+            markup.add(InlineKeyboardButton("✏️ Edit Text", callback_data=f"edit_this_msg_{data}"))
             
         has_photo = call.message.content_type == "photo" or (hasattr(call.message, 'photo') and call.message.photo is not None)
         
