@@ -1085,6 +1085,24 @@ def check_client_source_access(user_id, source_id):
 
     return False, "❌ No active bot or userbot available to verify access.", None
 
+# --- MENU TRACKING HELPERS ---
+last_menu_messages = {}  # {chat_id: message_id}
+
+def track_and_delete_last_menu(chat_id, new_message_id=None):
+    """
+    Deletes the last sent menu/prompt message for the chat if it exists.
+    If new_message_id is provided, stores it as the new last menu message.
+    """
+    if chat_id in last_menu_messages:
+        try:
+            bot.delete_message(chat_id, last_menu_messages[chat_id])
+        except Exception as e:
+            pass
+    if new_message_id:
+        last_menu_messages[chat_id] = new_message_id
+    else:
+        last_menu_messages.pop(chat_id, None)
+
 # --- ERROR MODERATION & ADMIN NOTIFICATION HELPERS ---
 def get_moderated_error_message(e):
     """
@@ -1461,6 +1479,7 @@ def show_bots_settings_panel(call):
 
 def send_bots_settings_panel(chat_id, user_id=None):
     """Sends the Bots configuration panel as a new message (used after text-based input flows)."""
+    track_and_delete_last_menu(chat_id)
     if user_id is None:
         user_id = chat_id  # in private chats, chat_id equals user_id
     welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
@@ -1468,12 +1487,14 @@ def send_bots_settings_panel(chat_id, user_id=None):
     markup = get_bots_settings_markup(user_id)
     if welcome_photo:
         try:
-            bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            msg = bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            last_menu_messages[chat_id] = msg.message_id
             return
         except Exception as e:
             logger.error(f"Error sending photo for bots settings: {e}")
             
-    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    last_menu_messages[chat_id] = msg.message_id
 
 def show_bot_details_panel(call, bot_id):
     """Transition to Bot Details panel where user can view and remove the bot."""
@@ -1643,6 +1664,7 @@ def show_channels_settings_panel(call):
 
 def send_channels_settings_panel(chat_id, user_id=None):
     """Sends the Channels settings panel as a new message (after text flows)."""
+    track_and_delete_last_menu(chat_id)
     if user_id is None:
         user_id = chat_id
     welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
@@ -1650,12 +1672,14 @@ def send_channels_settings_panel(chat_id, user_id=None):
     markup = get_channels_settings_markup(user_id)
     if welcome_photo:
         try:
-            bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            msg = bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            last_menu_messages[chat_id] = msg.message_id
             return
         except Exception as e:
             logger.error(f"Error sending photo for channels settings: {e}")
             
-    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    last_menu_messages[chat_id] = msg.message_id
 
 def show_channel_details_panel(call, c_id):
     """Transition to Channel Details panel where user can view and remove the target chat."""
@@ -1758,6 +1782,7 @@ def show_caption_settings_panel(call):
         logger.error(f"Error editing text: {e}")
 
 def send_caption_settings_panel(chat_id, user_id=None):
+    track_and_delete_last_menu(chat_id)
     if user_id is None:
         user_id = chat_id
     welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
@@ -1788,12 +1813,14 @@ def send_caption_settings_panel(chat_id, user_id=None):
     
     if welcome_photo:
         try:
-            bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            msg = bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            last_menu_messages[chat_id] = msg.message_id
             return
         except Exception as e:
             logger.error(f"Error sending photo: {e}")
             
-    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    last_menu_messages[chat_id] = msg.message_id
 
 def get_filters_markup(user_id, page=1):
     markup = InlineKeyboardMarkup()
@@ -1955,6 +1982,7 @@ def show_remove_words_settings_panel(call):
         logger.error(f"Error editing text: {e}")
 
 def send_remove_words_settings_panel(chat_id, user_id=None):
+    track_and_delete_last_menu(chat_id)
     if user_id is None:
         user_id = chat_id
     welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
@@ -1972,14 +2000,17 @@ def send_remove_words_settings_panel(chat_id, user_id=None):
     
     if welcome_photo:
         try:
-            bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            msg = bot.send_photo(chat_id, welcome_photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            last_menu_messages[chat_id] = msg.message_id
             return
         except Exception as e:
             logger.error(f"Error sending photo: {e}")
             
-    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    last_menu_messages[chat_id] = msg.message_id
 
 def show_admin_intro_menu(chat_id):
+    track_and_delete_last_menu(chat_id)
     welcome_photo = config.get("welcome_photo", "None")
     welcome_text = config.get("welcome_text", "")
     
@@ -1993,20 +2024,24 @@ def show_admin_intro_menu(chat_id):
         f"{welcome_text}\n\n"
         "💡 Use the buttons below to modify:"
     )
-    bot.send_message(chat_id, admin_msg, reply_markup=get_admin_intro_markup(), parse_mode="HTML")
+    msg = bot.send_message(chat_id, admin_msg, reply_markup=get_admin_intro_markup(), parse_mode="HTML")
+    last_menu_messages[chat_id] = msg.message_id
 
 def show_admin_buttons_menu(chat_id):
+    track_and_delete_last_menu(chat_id)
     btn_msg = (
         "🔘 <b>BUTTON RESPONSE MESSAGES</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Select a button below to configure the message sent when a user clicks it.\n"
         "All response messages support HTML formatting (bold, italic, quote, etc.)."
     )
-    bot.send_message(chat_id, btn_msg, reply_markup=get_admin_buttons_markup(), parse_mode="HTML")
+    msg = bot.send_message(chat_id, btn_msg, reply_markup=get_admin_buttons_markup(), parse_mode="HTML")
+    last_menu_messages[chat_id] = msg.message_id
 
 # --- CORE SENDER ---
 def send_welcome_message(chat_id, user):
     """Sends the welcome image, text and buttons with robust exception fallback."""
+    track_and_delete_last_menu(chat_id)
     welcome_text = config.get("welcome_text", DEFAULT_CONFIG["welcome_text"])
     welcome_photo = config.get("welcome_photo", DEFAULT_CONFIG["welcome_photo"])
     
@@ -2016,7 +2051,7 @@ def send_welcome_message(chat_id, user):
     # Check if a photo is set
     if welcome_photo:
         try:
-            bot.send_photo(
+            msg = bot.send_photo(
                 chat_id,
                 welcome_photo,
                 caption=formatted_text,
@@ -2024,17 +2059,19 @@ def send_welcome_message(chat_id, user):
                 parse_mode="HTML"
             )
             logger.info(f"Sent photo welcome message to user {user.id}")
+            last_menu_messages[chat_id] = msg.message_id
             return
         except Exception as e:
             logger.error(f"Failed to send photo welcome to {user.id}: {e}. Retrying photo with plain text caption...")
             try:
-                bot.send_photo(
+                msg = bot.send_photo(
                     chat_id,
                     welcome_photo,
                     caption=formatted_text,
                     reply_markup=markup
                 )
                 logger.info(f"Sent photo welcome message (plain text) to user {user.id}")
+                last_menu_messages[chat_id] = msg.message_id
                 return
             except Exception as pe2:
                 logger.error(f"Failed to send photo even as plain text: {pe2}. Falling back to text-only.")
@@ -2042,22 +2079,24 @@ def send_welcome_message(chat_id, user):
     
     # Text-only fallback
     try:
-        bot.send_message(
+        msg = bot.send_message(
             chat_id,
             formatted_text,
             reply_markup=markup,
             parse_mode="HTML"
         )
         logger.info(f"Sent text fallback welcome message to user {user.id}")
+        last_menu_messages[chat_id] = msg.message_id
     except Exception as e:
         logger.error(f"Failed to send HTML welcome message to {user.id}: {e}. Retrying as plain text...")
         try:
-            bot.send_message(
+            msg = bot.send_message(
                 chat_id,
                 formatted_text,
                 reply_markup=markup
             )
             logger.info(f"Sent plain text fallback welcome message to user {user.id}")
+            last_menu_messages[chat_id] = msg.message_id
         except Exception as e2:
             logger.critical(f"Failed to send welcome message entirely: {e2}")
 
@@ -2593,7 +2632,10 @@ def handle_admin_inputs(message):
         # Check for cancel command or text
         if message.text and message.text.strip().lower() == "/cancel":
             user_states[user_id] = None
-            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except:
+                pass
             send_channels_settings_panel(message.chat.id, user_id)
             return
 
@@ -2646,7 +2688,10 @@ def handle_admin_inputs(message):
     elif state == "WAITING_FOR_CUSTOM_CAPTION":
         if message.text and message.text.strip().lower() == "/cancel":
             user_states[user_id] = None
-            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except:
+                pass
             send_caption_settings_panel(message.chat.id, user_id)
             return
             
@@ -2666,7 +2711,10 @@ def handle_admin_inputs(message):
     elif state == "WAITING_FOR_REMOVE_WORD":
         if message.text and message.text.strip().lower() == "/cancel":
             user_states[user_id] = None
-            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except:
+                pass
             send_remove_words_settings_panel(message.chat.id, user_id)
             return
             
@@ -2696,7 +2744,10 @@ def handle_admin_inputs(message):
     elif state == "WAITING_FOR_DELETE_REMOVE_WORD":
         if message.text and message.text.strip().lower() == "/cancel":
             user_states[user_id] = None
-            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except:
+                pass
             send_remove_words_settings_panel(message.chat.id, user_id)
             return
             
@@ -2722,7 +2773,11 @@ def handle_admin_inputs(message):
     elif state == "WAITING_FOR_SOURCE_CHAT":
         if message.text and message.text.strip().lower() == "/cancel":
             user_states[user_id] = None
-            bot.reply_to(message, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except:
+                pass
+            send_channels_settings_panel(message.chat.id, user_id)
             return
             
         source_id = None
@@ -2856,7 +2911,8 @@ def handle_callbacks(call):
         elif data == "settings_bots_add":
             bot.answer_callback_query(call.id)
             user_states[user_id] = "WAITING_FOR_BOT_TOKEN"
-            bot.send_message(
+            track_and_delete_last_menu(chat_id)
+            msg = bot.send_message(
                 chat_id,
                 "🤖 <b>Adding Custom Bot</b>\n━━━━━━━━━━━━━━━━━━━━\n"
                 "Please send the Bot Token (from @BotFather) of the bot you want to add.\n\n"
@@ -2864,16 +2920,19 @@ def handle_callbacks(call):
                 reply_markup=get_cancel_markup(),
                 parse_mode="HTML"
             )
+            last_menu_messages[chat_id] = msg.message_id
         elif data == "settings_bots_userbot":
             bot.answer_callback_query(call.id)
             user_states[user_id] = "WAITING_FOR_PHONE"
-            bot.send_message(
+            track_and_delete_last_menu(chat_id)
+            msg = bot.send_message(
                 chat_id,
                 "👤 <b>Adding Custom Userbot</b>\n━━━━━━━━━━━━━━━━━━━━\n"
                 "Please enter your Phone Number (with country code, e.g., <code>+1234567890</code>):",
                 reply_markup=get_cancel_markup(),
                 parse_mode="HTML"
             )
+            last_menu_messages[chat_id] = msg.message_id
         elif data == "settings_menu":
             bot.answer_callback_query(call.id)
             show_settings_panel(call)
@@ -2883,20 +2942,24 @@ def handle_callbacks(call):
         elif data == "settings_channels_add":
             bot.answer_callback_query(call.id)
             user_states[user_id] = "WAITING_FOR_TARGET_CHAT"
-            bot.send_message(
+            track_and_delete_last_menu(chat_id)
+            msg = bot.send_message(
                 chat_id,
                 "<b>( SET TARGET CHAT )</b>\n\n"
                 "Forward a message from Your target chat\n"
                 "/cancel - cancel this process",
+                reply_markup=get_cancel_markup(),
                 parse_mode="HTML"
             )
+            last_menu_messages[chat_id] = msg.message_id
         elif data == "settings_caption":
             bot.answer_callback_query(call.id)
             show_caption_settings_panel(call)
         elif data == "settings_caption_add":
             bot.answer_callback_query(call.id)
             user_states[user_id] = "WAITING_FOR_CUSTOM_CAPTION"
-            bot.send_message(
+            track_and_delete_last_menu(chat_id)
+            msg = bot.send_message(
                 chat_id,
                 "🖊️ <b>Add/Edit Custom Caption</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -2909,6 +2972,7 @@ def handle_callbacks(call):
                 reply_markup=get_cancel_markup(),
                 parse_mode="HTML"
             )
+            last_menu_messages[chat_id] = msg.message_id
         elif data == "settings_caption_remove":
             bot.answer_callback_query(call.id, "✅ Custom caption removed!", show_alert=True)
             settings = get_user_settings(user_id)
@@ -2989,7 +3053,8 @@ def handle_callbacks(call):
         
         if action == "add":
             user_states[user_id] = "WAITING_FOR_REMOVE_WORD"
-            bot.send_message(
+            track_and_delete_last_menu(chat_id)
+            msg = bot.send_message(
                 chat_id,
                 "🚫 <b>Add Remove Word(s)</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -2998,9 +3063,11 @@ def handle_callbacks(call):
                 reply_markup=get_cancel_markup(),
                 parse_mode="HTML"
             )
+            last_menu_messages[chat_id] = msg.message_id
         elif action == "delete":
             user_states[user_id] = "WAITING_FOR_DELETE_REMOVE_WORD"
-            bot.send_message(
+            track_and_delete_last_menu(chat_id)
+            msg = bot.send_message(
                 chat_id,
                 "🚫 <b>Delete Remove Word</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -3009,6 +3076,7 @@ def handle_callbacks(call):
                 reply_markup=get_cancel_markup(),
                 parse_mode="HTML"
             )
+            last_menu_messages[chat_id] = msg.message_id
         elif action == "view":
             settings = get_user_settings(user_id)
             words = settings.get("remove_words", [])
@@ -3220,7 +3288,8 @@ def handle_callbacks(call):
                     except:
                         pass
                         
-            bot.send_message(chat_id, "❌ <b>Operation Cancelled.</b>", parse_mode="HTML")
+            track_and_delete_last_menu(chat_id)
+            bot.answer_callback_query(call.id, "❌ Operation Cancelled.")
             
             if current_state:
                 if current_state.startswith("WAITING_FOR_BTN_"):
