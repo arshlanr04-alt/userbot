@@ -933,6 +933,48 @@ def is_admin(user_id):
     """Checks if a user ID is listed in the admin list."""
     return user_id in config.get("admin_ids", [])
 
+# --- WRAPPED SEND METHODS FOR ADMIN EDIT BUTTON ---
+original_send_message = bot.send_message
+original_send_photo = bot.send_photo
+original_reply_to = bot.reply_to
+
+def add_edit_button_to_markup(chat_id, reply_markup):
+    if is_admin(chat_id):
+        if reply_markup is None:
+            reply_markup = InlineKeyboardMarkup()
+        elif not isinstance(reply_markup, InlineKeyboardMarkup):
+            return reply_markup
+        
+        # Check if Edit button is already there
+        has_edit = False
+        for row in reply_markup.keyboard:
+            for btn in row:
+                if getattr(btn, "callback_data", None) == "edit_this_msg":
+                    has_edit = True
+                    break
+        if not has_edit:
+            reply_markup.add(InlineKeyboardButton("✏️ Edit Text", callback_data="edit_this_msg"))
+    return reply_markup
+
+def wrapped_send_message(chat_id, text, *args, **kwargs):
+    reply_markup = kwargs.get("reply_markup")
+    kwargs["reply_markup"] = add_edit_button_to_markup(chat_id, reply_markup)
+    return original_send_message(chat_id, text, *args, **kwargs)
+
+def wrapped_send_photo(chat_id, photo, *args, **kwargs):
+    reply_markup = kwargs.get("reply_markup")
+    kwargs["reply_markup"] = add_edit_button_to_markup(chat_id, reply_markup)
+    return original_send_photo(chat_id, photo, *args, **kwargs)
+
+def wrapped_reply_to(message, text, *args, **kwargs):
+    reply_markup = kwargs.get("reply_markup")
+    kwargs["reply_markup"] = add_edit_button_to_markup(message.chat.id, reply_markup)
+    return original_reply_to(message, text, *args, **kwargs)
+
+bot.send_message = wrapped_send_message
+bot.send_photo = wrapped_send_photo
+bot.reply_to = wrapped_reply_to
+
 def format_welcome_message(text, user):
     """Substitutes user variables in the welcome message."""
     first_name = user.first_name if user.first_name else "User"
@@ -2263,7 +2305,55 @@ def handle_admin_inputs(message):
         
     global config
     
-    if state == "WAITING_FOR_TEXT":
+    if state and state.startswith("EDITING_MSG_"):
+        if message.text and message.text.strip().lower() == "/cancel":
+            user_states[user_id] = None
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except:
+                pass
+            send_welcome_message(message.chat.id, message.from_user)
+            return
+            
+        target_msg_id = int(state.replace("EDITING_MSG_", ""))
+        new_text = message.text
+        
+        # Delete user's message
+        try:
+            bot.delete_message(message.chat.id, message.message_id)
+        except:
+            pass
+            
+        # Delete the previous prompt (edit prompt)
+        track_and_delete_last_menu(message.chat.id)
+        
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Edit Text", callback_data="edit_this_msg")]])
+            
+        try:
+            bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=target_msg_id,
+                text=new_text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            user_states[user_id] = None
+        except Exception as e:
+            try:
+                bot.edit_message_caption(
+                    chat_id=message.chat.id,
+                    message_id=target_msg_id,
+                    caption=new_text,
+                    reply_markup=markup,
+                    parse_mode="HTML"
+                )
+                user_states[user_id] = None
+            except Exception as e2:
+                bot.send_message(message.chat.id, f"❌ <b>Failed to edit message:</b> {e2}", parse_mode="HTML")
+                user_states[user_id] = None
+        return
+
+    elif state == "WAITING_FOR_TEXT":
         if not message.text:
             bot.reply_to(message, "❌ Please send text only for the welcome message.", reply_markup=get_cancel_markup())
             return
@@ -2879,6 +2969,26 @@ def handle_callbacks(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     data = call.data
+
+    if data == "edit_this_msg":
+        bot.answer_callback_query(call.id)
+        if is_admin(user_id):
+            user_states[user_id] = f"EDITING_MSG_{call.message.message_id}"
+            track_and_delete_last_menu(chat_id)
+            msg = bot.send_message(
+                chat_id,
+                "✏️ <b>Edit Message Content</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                "Please send the new text for the message. You can use HTML formatting tags:\n"
+                "• <code>&lt;b&gt;bold&lt;/b&gt;</code>\n"
+                "• <code>&lt;i&gt;italic&lt;/i&gt;</code>\n"
+                "• <code>&lt;code&gt;monospace&lt;/code&gt;</code>\n"
+                "• <code>&lt;blockquote&gt;blockquote&lt;/blockquote&gt;</code>\n\n"
+                "Send the new text now, or type `/cancel` to abort.",
+                reply_markup=get_cancel_markup(),
+                parse_mode="HTML"
+            )
+            last_menu_messages[chat_id] = msg.message_id
+        return
     
     # ─── USER BUTTON CALLBACKS ───
     if data.startswith("user_"):
